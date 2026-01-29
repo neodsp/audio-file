@@ -1,14 +1,12 @@
 #![doc = include_str!("../README.md")]
 
-#[cfg(feature = "read")]
-pub use reader::{AudioData, AudioReadConfig, AudioReadError, Position, audio_read};
-
-#[cfg(feature = "write")]
+#[cfg(feature = "audio-blocks")]
+pub use reader::audio_read_block;
+pub use reader::{Audio, AudioReadConfig, AudioReadError, Position, audio_read};
+#[cfg(feature = "audio-blocks")]
+pub use writer::audio_write_block;
 pub use writer::{AudioWriteConfig, AudioWriteError, audio_write};
 
-pub use audio_blocks::*;
-
-#[cfg(feature = "read")]
 pub mod reader;
-#[cfg(feature = "write")]
+pub mod resample;
 pub mod writer;

@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use audio_blocks::AudioBlock;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use num::Float;
 use thiserror::Error;
@@ -28,14 +27,16 @@ pub struct AudioWriteConfig {
     pub sample_format: WriteSampleFormat,
 }
 
-pub fn audio_write<P: AsRef<Path>, F: Float + 'static>(
-    path: P,
-    audio_block: impl AudioBlock<F>,
+/// Write interleaved audio samples to a WAV file
+pub fn audio_write<F: Float>(
+    path: impl AsRef<Path>,
+    samples: &[F],
+    num_channels: u16,
     sample_rate: u32,
     config: AudioWriteConfig,
 ) -> Result<(), AudioWriteError> {
     let spec = WavSpec {
-        channels: audio_block.num_channels(),
+        channels: num_channels,
         sample_rate,
         bits_per_sample: match config.sample_format {
             WriteSampleFormat::Int16 => 16,
@@ -51,23 +52,19 @@ pub fn audio_write<P: AsRef<Path>, F: Float + 'static>(
 
     match config.sample_format {
         WriteSampleFormat::Int16 => {
-            // Convert f32 samples to i16
-            for frame in audio_block.frame_iters() {
-                for sample in frame {
-                    let sample_i16 = (sample.clamp(F::one().neg(), F::one())
-                        * F::from(i16::MAX).unwrap_or(F::zero()))
-                    .to_i16()
-                    .unwrap_or(0);
-                    writer.write_sample(sample_i16)?;
-                }
+            // Convert samples to i16
+            for &sample in samples {
+                let sample_i16 = (sample.clamp(F::one().neg(), F::one())
+                    * F::from(i16::MAX).unwrap_or(F::zero()))
+                .to_i16()
+                .unwrap_or(0);
+                writer.write_sample(sample_i16)?;
             }
         }
         WriteSampleFormat::Float32 => {
             // Write f32 samples directly
-            for frame in audio_block.frame_iters() {
-                for sample in frame {
-                    writer.write_sample(sample.to_f32().unwrap_or(0.0))?;
-                }
+            for &sample in samples {
+                writer.write_sample(sample.to_f32().unwrap_or(0.0))?;
             }
         }
     }
@@ -77,33 +74,51 @@ pub fn audio_write<P: AsRef<Path>, F: Float + 'static>(
     Ok(())
 }
 
+/// Write audio from an AudioBlock to a WAV file
+#[cfg(feature = "audio-blocks")]
+pub fn audio_write_block<P: AsRef<Path>, F: Float + 'static>(
+    path: P,
+    audio_block: impl audio_blocks::AudioBlock<F>,
+    sample_rate: u32,
+    config: AudioWriteConfig,
+) -> Result<(), AudioWriteError> {
+    let block = audio_blocks::AudioBlockInterleaved::from_block(&audio_block);
+    audio_write(
+        path,
+        block.raw_data(),
+        audio_block.num_channels(),
+        sample_rate,
+        config,
+    )
+}
+
 #[cfg(test)]
 mod tests {
 
     #[test]
-    #[cfg(all(feature = "read", feature = "write"))]
     fn test_round_trip_i16() {
         use super::*;
         use crate::reader::{AudioReadConfig, audio_read};
 
-        let data1 =
-            audio_read::<_, f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
+        let audio1 =
+            audio_read::<f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
 
         audio_write(
             "tmp1.wav",
-            data1.audio_block(),
-            data1.sample_rate,
+            &audio1.samples_interleaved,
+            audio1.num_channels,
+            audio1.sample_rate,
             AudioWriteConfig {
                 sample_format: WriteSampleFormat::Int16,
             },
         )
         .unwrap();
 
-        let data2 = audio_read::<_, f32>("tmp1.wav", AudioReadConfig::default()).unwrap();
-        assert_eq!(data1.sample_rate, data2.sample_rate);
+        let audio2 = audio_read::<f32>("tmp1.wav", AudioReadConfig::default()).unwrap();
+        assert_eq!(audio1.sample_rate, audio2.sample_rate);
         approx::assert_abs_diff_eq!(
-            data1.audio_block().raw_data(),
-            data2.audio_block().raw_data(),
+            audio1.samples_interleaved.as_slice(),
+            audio2.samples_interleaved.as_slice(),
             epsilon = 1e-4
         );
 
@@ -111,29 +126,29 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "read", feature = "write"))]
     fn test_round_trip_f32() {
         use super::*;
         use crate::reader::{AudioReadConfig, audio_read};
 
-        let data1 =
-            audio_read::<_, f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
+        let audio1 =
+            audio_read::<f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
 
         audio_write(
             "tmp2.wav",
-            data1.audio_block(),
-            data1.sample_rate,
+            &audio1.samples_interleaved,
+            audio1.num_channels,
+            audio1.sample_rate,
             AudioWriteConfig {
                 sample_format: WriteSampleFormat::Float32,
             },
         )
         .unwrap();
 
-        let data2 = audio_read::<_, f32>("tmp2.wav", AudioReadConfig::default()).unwrap();
-        assert_eq!(data1.sample_rate, data2.sample_rate);
+        let audio2 = audio_read::<f32>("tmp2.wav", AudioReadConfig::default()).unwrap();
+        assert_eq!(audio1.sample_rate, audio2.sample_rate);
         approx::assert_abs_diff_eq!(
-            data1.audio_block().raw_data(),
-            data2.audio_block().raw_data(),
+            audio1.samples_interleaved.as_slice(),
+            audio2.samples_interleaved.as_slice(),
             epsilon = 1e-6
         );
 
