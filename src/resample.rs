@@ -1,4 +1,5 @@
 use audioadapter_buffers::direct::InterleavedSlice;
+use num::Float;
 use rubato::Fft;
 use rubato::Resampler as _;
 use thiserror::Error;
@@ -11,13 +12,13 @@ pub enum ResampleError {
     ResampleError(#[from] rubato::ResampleError),
 }
 
-pub fn resample(
-    audio_interleaved: &[f32],
-    num_channels: u16,
+pub fn resample<F: Float + rubato::Sample>(
+    audio_interleaved: &[F],
+    num_channels: usize,
     sr_in: u32,
     sr_out: u32,
-) -> Result<Vec<f32>, ResampleError> {
-    let mut resampler = Fft::<f32>::new(
+) -> Result<Vec<F>, ResampleError> {
+    let mut resampler = Fft::new(
         sr_in as usize,
         sr_out as usize,
         1024,
@@ -32,7 +33,7 @@ pub fn resample(
             .expect("Should be the right size");
 
     let num_output_frames = resampler.process_all_needed_output_len(num_input_frames);
-    let mut out_slice = vec![0.0; num_output_frames * num_channels as usize];
+    let mut out_slice = vec![F::zero(); num_output_frames * num_channels as usize];
     let mut buffer_out =
         InterleavedSlice::new_mut(&mut out_slice, num_channels as usize, num_output_frames)
             .expect("should be the right size");
@@ -52,41 +53,37 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "read")]
     fn test_resample_preserves_frequency() {
         use crate::reader::{AudioReadConfig, audio_read};
         use audio_blocks::{AudioBlock, AudioBlockInterleavedView};
 
         // Read the test file
-        let data =
-            audio_read::<_, f32>("test_data/test_4ch.wav", AudioReadConfig::default()).unwrap();
+        let audio =
+            audio_read::<f32>("test_data/test_4ch.wav", AudioReadConfig::default()).unwrap();
 
-        assert_eq!(data.sample_rate, 48000);
-        assert_eq!(data.num_channels, 4);
+        assert_eq!(audio.sample_rate, 48000);
+        assert_eq!(audio.num_channels, 4);
 
         // Resample from 48000 Hz to 22050 Hz
-        let sr_out = 22050;
+        let sr_out = 22050u32;
         let resampled = resample(
-            &data.interleaved_samples,
-            data.num_channels as u16,
-            data.sample_rate,
+            &audio.samples_interleaved,
+            audio.num_channels as usize,
+            audio.sample_rate,
             sr_out,
         )
         .unwrap();
 
-        // Create an audio block view for the resampled data
-        let num_frames = resampled.len() / data.num_channels;
-        let block =
-            AudioBlockInterleavedView::from_slice(&resampled, data.num_channels as u16, num_frames);
-
-        assert_eq!(block.num_channels(), 4);
+        let block = AudioBlockInterleavedView::from_slice(&resampled, audio.num_channels);
 
         // Expected frames after resampling: 48000 * (22050/48000) = 22050
-        let expected_frames = (48000.0 * 22050.0 / 48000.0) as usize;
+        let expected_frames = 22050usize;
         assert_eq!(
-            num_frames, expected_frames,
+            block.num_frames(),
+            expected_frames,
             "Expected {} frames, got {}",
-            expected_frames, num_frames
+            expected_frames,
+            block.num_frames()
         );
 
         // Verify sine wave frequencies are preserved after resampling
