@@ -284,7 +284,10 @@ pub fn audio_read_block<F: num::Float + 'static + rubato::Sample>(
 ) -> Result<(audio_blocks::AudioBlockInterleaved<F>, u32), AudioReadError> {
     let audio = audio_read(path, config)?;
     Ok((
-        audio_blocks::AudioBlockInterleaved::from_slice(&audio.samples, audio.num_channels),
+        audio_blocks::AudioBlockInterleaved::from_slice(
+            &audio.samples_interleaved,
+            audio.num_channels,
+        ),
         audio.sample_rate,
     ))
 }

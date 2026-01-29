@@ -23,20 +23,18 @@ pub fn resample<F: Float + rubato::Sample>(
         sr_out as usize,
         1024,
         2,
-        num_channels as usize,
+        num_channels,
         rubato::FixedSync::Both,
     )?;
 
-    let num_input_frames = audio_interleaved.len() / num_channels as usize;
-    let buffer_in =
-        InterleavedSlice::new(audio_interleaved, num_channels as usize, num_input_frames)
-            .expect("Should be the right size");
+    let num_input_frames = audio_interleaved.len() / num_channels;
+    let buffer_in = InterleavedSlice::new(audio_interleaved, num_channels, num_input_frames)
+        .expect("Should be the right size");
 
     let num_output_frames = resampler.process_all_needed_output_len(num_input_frames);
-    let mut out_slice = vec![F::zero(); num_output_frames * num_channels as usize];
-    let mut buffer_out =
-        InterleavedSlice::new_mut(&mut out_slice, num_channels as usize, num_output_frames)
-            .expect("should be the right size");
+    let mut out_slice = vec![F::zero(); num_output_frames * num_channels];
+    let mut buffer_out = InterleavedSlice::new_mut(&mut out_slice, num_channels, num_output_frames)
+        .expect("should be the right size");
 
     // process_all_into_buffer returns (input_frames_used, output_frames_written)
     // It already trims the resampler delay internally
@@ -44,7 +42,7 @@ pub fn resample<F: Float + rubato::Sample>(
         resampler.process_all_into_buffer(&buffer_in, &mut buffer_out, num_input_frames, None)?;
 
     // Truncate to actual output length
-    out_slice.truncate(actual_output_frames * num_channels as usize);
+    out_slice.truncate(actual_output_frames * num_channels);
     Ok(out_slice)
 }
 
