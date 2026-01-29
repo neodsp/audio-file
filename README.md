@@ -138,7 +138,7 @@ let audio = audio_read::<f32>(
 ```
 
 - read from frame 300 to 400
-- 
+
 ```rs
 let audio = audio_read::<f32>(
     "test.wav",
