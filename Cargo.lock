@@ -34,7 +34,7 @@ checksum = "f93ebbf82d06013f4c41fe71303feb980cddd78496d904d06be627972de51a24"
 
 [[package]]
 name = "audio-io"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "approx",
  "audio-blocks",
