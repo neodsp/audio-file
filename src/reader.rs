@@ -11,7 +11,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use thiserror::Error;
 
-use crate::resample::resample;
+use crate::resample::{ResampleError, resample};
 
 /// Audio data with interleaved samples
 #[derive(Debug, Clone)]
@@ -40,6 +40,8 @@ pub enum AudioReadError {
     InvalidStartChannel(usize, usize),
     #[error("invalid number of channels to extract: {0}")]
     InvalidNumChannels(usize),
+    #[error("could not resample audio with specified settings")]
+    ResampleError(#[from] ResampleError),
 }
 
 /// Position in the audio stream (for start or stop points)
@@ -262,7 +264,7 @@ pub fn audio_read<F: Float + rubato::Sample>(
     }
 
     let samples = if let Some(sr_out) = config.sample_rate {
-        resample(&samples, num_channels, sample_rate, sr_out).unwrap()
+        resample(&samples, num_channels, sample_rate, sr_out)?
     } else {
         samples
     };
