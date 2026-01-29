@@ -10,7 +10,7 @@ The library can read many formats and can write only to wav files.
 
 You can read most common audio formats. The default feature set enables all available codecs.
 
-```rs
+```rust
 use audio_io::*;
 
 let audio = audio_read::<f32>("test.wav", AudioReadConfig::default())?;
@@ -21,7 +21,7 @@ let samples = &audio.samples_interleaved;
 
 With `audio-blocks`, you can read straight into an `AudioBlock`, which adds simple channel-based read helpers:
 
-```rs
+```rust
 use audio_io::*;
 
 let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::default())?;
@@ -31,7 +31,7 @@ let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::
 
 You can only write wav files. The `audio_write` function expects interleaved samples.
 
-```rs
+```rust
 use audio_io::*;
 
 let sample_rate = 48000;
@@ -49,7 +49,7 @@ audio_write(
 
 With the `audio-blocks` feature you can write any audio layout, e.g.:
 
-```rs
+```rust
 use audio_blocks::{AudioBlockInterleavedView, AudioBlockSequentialView};
 use audio_io::*;
 
@@ -113,7 +113,7 @@ By default `Int16` is selected, for broader compatibility.
 
 - resample to 22.05 kHz while reading
 
-```rs
+```rust
 let audio = audio_read::<f32>(
     "test.wav",
     AudioReadConfig {
@@ -125,7 +125,7 @@ let audio = audio_read::<f32>(
 
 - read the first 0.5 seconds
 
-```rs
+```rust
 use std::time::Duration;
 
 let audio = audio_read::<f32>(
@@ -139,7 +139,7 @@ let audio = audio_read::<f32>(
 
 - read from frame 300 to 400
 
-```rs
+```rust
 let audio = audio_read::<f32>(
     "test.wav",
     AudioReadConfig {
@@ -152,7 +152,7 @@ let audio = audio_read::<f32>(
 
 - read only the first two channels
 
-```rs
+```rust
 let audio = audio_read::<f32>(
     "test.wav",
     AudioReadConfig {
@@ -164,7 +164,7 @@ let audio = audio_read::<f32>(
 
 - skip the first channel, reading channel 2 and 3
 
-```rs
+```rust
 let audio = audio_read::<f32>(
     "test.wav",
     AudioReadConfig {
@@ -177,7 +177,7 @@ let audio = audio_read::<f32>(
 
 - write audio samples in `Float32`
 
-```rs
+```rust
 audio_write(
     "tmp.wav",
     &samples_interleaved,
