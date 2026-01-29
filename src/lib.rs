@@ -12,3 +12,5 @@ pub use audio_blocks::*;
 pub mod reader;
 #[cfg(feature = "write")]
 pub mod writer;
+
+pub mod resample;

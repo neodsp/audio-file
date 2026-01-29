@@ -52,7 +52,7 @@ pub fn audio_write<P: AsRef<Path>, F: Float + 'static>(
     match config.sample_format {
         WriteSampleFormat::Int16 => {
             // Convert f32 samples to i16
-            for frame in audio_block.frame_iters() {
+            for frame in audio_block.frames_iter() {
                 for sample in frame {
                     let sample_i16 = (sample.clamp(F::one().neg(), F::one())
                         * F::from(i16::MAX).unwrap_or(F::zero()))
@@ -64,7 +64,7 @@ pub fn audio_write<P: AsRef<Path>, F: Float + 'static>(
         }
         WriteSampleFormat::Float32 => {
             // Write f32 samples directly
-            for frame in audio_block.frame_iters() {
+            for frame in audio_block.frames_iter() {
                 for sample in frame {
                     writer.write_sample(sample.to_f32().unwrap_or(0.0))?;
                 }
