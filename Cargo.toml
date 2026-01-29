@@ -9,7 +9,7 @@ name = "audio-io"
 readme = "README.md"
 repository = "https://github.com/neodsp/audio-io"
 rust-version = "1.88"
-version = "0.4.0"
+version = "0.3.2"
 
 [dependencies]
 approx = "0.5"
@@ -26,8 +26,10 @@ audio-blocks = { version = "0.6", optional = true }
 audio-blocks = { version = "0.6" }
 
 [features]
-audio-blocks = ["dep:audio-blocks"]
 default = ["all-codecs"]
+
+# Add utility functions for channel access etc
+audio-blocks = ["dep:audio-blocks"]
 
 # All codecs including royalty-encumbered formats (MP3, AAC, etc.)
 all-codecs = ["symphonia/all"]

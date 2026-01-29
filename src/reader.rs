@@ -11,7 +11,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use thiserror::Error;
 
-use crate::resample::{ResampleError, resample};
+use crate::resample::resample;
 
 /// Audio data with interleaved samples
 #[derive(Debug, Clone)]
@@ -40,8 +40,6 @@ pub enum AudioReadError {
     InvalidStartChannel(usize, usize),
     #[error("invalid number of channels to extract: {0}")]
     InvalidNumChannels(usize),
-    #[error("could not resample audio with specified settings")]
-    ResampleError(#[from] ResampleError),
 }
 
 /// Position in the audio stream (for start or stop points)
@@ -136,7 +134,11 @@ pub fn audio_read<F: Float + rubato::Sample>(
         ));
     }
 
-    // If start_frame is large (more than 1 second), use seeking to avoid decoding everything
+    // Optimization: Use seeking for large offsets to avoid decoding unnecessary data.
+    // For small offsets (< 1 second), we decode from the beginning and discard samples,
+    // which is simpler and avoids seek complexity. This threshold balances simplicity
+    // with performance - seeking has overhead and keyframe alignment issues that make
+    // it inefficient for small offsets.
     if start_frame > sample_rate as usize
         && let Some(tb) = time_base
     {
@@ -263,18 +265,23 @@ pub fn audio_read<F: Float + rubato::Sample>(
         }
     }
 
+    // Calculate the actual channel count in the extracted samples
+    let ch_start = start_channel.unwrap_or(0);
+    let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
+
     let samples = if let Some(sr_out) = config.sample_rate {
-        resample(&samples, num_channels, sample_rate, sr_out)?
+        // Use ch_count (the selected channels) not num_channels (original file channels)
+        resample(&samples, ch_count, sample_rate, sr_out).map_err(|_| AudioReadError::NoTrack)?
     } else {
         samples
     };
 
-    let ch_start = start_channel.unwrap_or(0);
-    let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
+    // Return the actual sample rate (resampled if applicable, otherwise original)
+    let actual_sample_rate = config.sample_rate.unwrap_or(sample_rate);
 
     Ok(Audio {
         samples_interleaved: samples,
-        sample_rate,
+        sample_rate: actual_sample_rate,
         num_channels: ch_count as u16,
     })
 }
@@ -523,7 +530,7 @@ mod tests {
         .unwrap();
         let block = to_block(&audio);
 
-        assert_eq!(audio.sample_rate, 48000); // Original sample rate is preserved in metadata
+        assert_eq!(audio.sample_rate, sr_out); // Resampled sample rate is returned
         assert_eq!(block.num_channels(), 4);
 
         // Expected frames after resampling: 48000 * (22050/48000) = 22050
@@ -542,6 +549,67 @@ mod tests {
         let test_frames = 1000;
 
         for (ch, &freq) in FREQUENCIES.iter().enumerate() {
+            let mut max_error: f32 = 0.0;
+            for frame in start_frame..(start_frame + test_frames) {
+                let expected =
+                    (2.0 * std::f64::consts::PI * freq * frame as f64 / sr_out as f64).sin() as f32;
+                let actual = block.sample(ch as u16, frame);
+                let error = (actual - expected).abs();
+                max_error = max_error.max(error);
+            }
+            assert!(
+                max_error < 0.02,
+                "Channel {} ({}Hz): max error {} exceeds threshold",
+                ch,
+                freq,
+                max_error
+            );
+        }
+    }
+
+    #[test]
+    fn test_channel_selection_with_resampling() {
+        // This test verifies that channel selection combined with resampling works correctly
+        const FREQUENCIES: [f64; 4] = [440.0, 554.37, 659.25, 880.0];
+        let sr_out: u32 = 22050;
+
+        // Read channels 1 and 2 (indices 1 and 2) with resampling
+        let audio = audio_read::<f32>(
+            "test_data/test_4ch.wav",
+            AudioReadConfig {
+                start_channel: Some(1),
+                num_channels: Some(2),
+                sample_rate: Some(sr_out),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let block = to_block(&audio);
+
+        assert_eq!(audio.num_channels, 2, "Should have 2 channels");
+        assert_eq!(
+            audio.sample_rate, sr_out,
+            "Sample rate should be the resampled rate"
+        );
+
+        // Expected frames after resampling: 48000 * (22050/48000) = 22050
+        let expected_frames = 22050;
+        assert_eq!(
+            block.num_frames(),
+            expected_frames,
+            "Expected {} frames, got {}",
+            expected_frames,
+            block.num_frames()
+        );
+
+        // Verify that the resampled audio contains the correct frequencies
+        // Channels 1 and 2 should have frequencies 554.37 Hz and 659.25 Hz
+        let selected_freqs = &FREQUENCIES[1..3];
+
+        let start_frame = 100;
+        let test_frames = 1000;
+
+        for (ch, &freq) in selected_freqs.iter().enumerate() {
             let mut max_error: f32 = 0.0;
             for frame in start_frame..(start_frame + test_frames) {
                 let expected =

@@ -122,7 +122,8 @@ mod tests {
             epsilon = 1e-4
         );
 
-        let _ = std::fs::remove_file("tmp1.wav");
+        // Clean up temporary file
+        std::fs::remove_file("tmp1.wav").expect("Failed to remove temporary test file");
     }
 
     #[test]
@@ -152,6 +153,7 @@ mod tests {
             epsilon = 1e-6
         );
 
-        let _ = std::fs::remove_file("tmp2.wav");
+        // Clean up temporary file
+        std::fs::remove_file("tmp2.wav").expect("Failed to remove temporary test file");
     }
 }
