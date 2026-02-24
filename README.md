@@ -98,8 +98,16 @@ The crate will try to decode and store only the parts that you selected.
 
 ### Writing
 
-For writing audio you can only select to store the audio in `Int16` or `Float32`.
-By default `Int16` is selected, for broader compatibility.
+For writing audio you can select from the following sample formats:
+
+| Format | Description |
+|--------|-------------|
+| `Int8` | 8-bit integer |
+| `Int16` | 16-bit integer (default) |
+| `Int32` | 32-bit integer |
+| `Float32` | 32-bit float |
+
+`Int16` is the default, for broader compatibility.
 
 ### Some example configs:
 

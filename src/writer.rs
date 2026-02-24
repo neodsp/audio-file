@@ -12,9 +12,13 @@ pub enum WriteError {
 /// Sample format for writing audio
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SampleFormat {
+    /// 8-bit integer samples
+    Int8,
     /// 16-bit integer samples
     #[default]
     Int16,
+    /// 32-bit integer samples
+    Int32,
     /// 32-bit float samples
     Float32,
 }
@@ -38,11 +42,15 @@ pub fn write<F: Float>(
         channels: num_channels,
         sample_rate,
         bits_per_sample: match config.sample_format {
+            SampleFormat::Int8 => 8,
             SampleFormat::Int16 => 16,
+            SampleFormat::Int32 => 32,
             SampleFormat::Float32 => 32,
         },
         sample_format: match config.sample_format {
-            SampleFormat::Int16 => hound::SampleFormat::Int,
+            SampleFormat::Int8 | SampleFormat::Int16 | SampleFormat::Int32 => {
+                hound::SampleFormat::Int
+            }
             SampleFormat::Float32 => hound::SampleFormat::Float,
         },
     };
@@ -50,8 +58,16 @@ pub fn write<F: Float>(
     let mut writer = hound::WavWriter::create(path.as_ref(), spec)?;
 
     match config.sample_format {
+        SampleFormat::Int8 => {
+            for &sample in samples {
+                let sample_i8 = (sample.clamp(F::one().neg(), F::one())
+                    * F::from(i8::MAX).unwrap_or(F::zero()))
+                .to_i8()
+                .unwrap_or(0);
+                writer.write_sample(sample_i8)?;
+            }
+        }
         SampleFormat::Int16 => {
-            // Convert samples to i16
             for &sample in samples {
                 let sample_i16 = (sample.clamp(F::one().neg(), F::one())
                     * F::from(i16::MAX).unwrap_or(F::zero()))
@@ -60,8 +76,16 @@ pub fn write<F: Float>(
                 writer.write_sample(sample_i16)?;
             }
         }
+        SampleFormat::Int32 => {
+            for &sample in samples {
+                let sample_i32 = (sample.clamp(F::one().neg(), F::one())
+                    * F::from(i32::MAX).unwrap_or(F::zero()))
+                .to_i32()
+                .unwrap_or(0);
+                writer.write_sample(sample_i32)?;
+            }
+        }
         SampleFormat::Float32 => {
-            // Write f32 samples directly
             for &sample in samples {
                 writer.write_sample(sample.to_f32().unwrap_or(0.0))?;
             }
@@ -95,6 +119,39 @@ pub fn write_block<P: AsRef<Path>, F: Float + 'static>(
 mod tests {
 
     #[test]
+    fn test_round_trip_i8() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
+
+        write(
+            "tmp0.wav",
+            &audio1.samples_interleaved,
+            audio1.num_channels,
+            audio1.sample_rate,
+            WriteConfig {
+                sample_format: SampleFormat::Int8,
+            },
+        )
+        .unwrap();
+
+        let audio2 = read::<f32>("tmp0.wav", ReadConfig::default()).unwrap();
+        assert_eq!(audio1.sample_rate, audio2.sample_rate);
+        // 8-bit PCM has low precision. Symphonia normalizes by dividing by 128
+        // (not 127), so max representable value is 127/128 ≈ 0.992, giving a
+        // worst-case error of ~0.016 near full scale.
+        approx::assert_abs_diff_eq!(
+            audio1.samples_interleaved.as_slice(),
+            audio2.samples_interleaved.as_slice(),
+            epsilon = 2e-2
+        );
+
+        // Clean up temporary file
+        std::fs::remove_file("tmp0.wav").expect("Failed to remove temporary test file");
+    }
+
+    #[test]
     fn test_round_trip_i16() {
         use super::*;
         use crate::reader::{ReadConfig, read};
@@ -122,6 +179,36 @@ mod tests {
 
         // Clean up temporary file
         std::fs::remove_file("tmp1.wav").expect("Failed to remove temporary test file");
+    }
+
+    #[test]
+    fn test_round_trip_i32() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
+
+        write(
+            "tmp3.wav",
+            &audio1.samples_interleaved,
+            audio1.num_channels,
+            audio1.sample_rate,
+            WriteConfig {
+                sample_format: SampleFormat::Int32,
+            },
+        )
+        .unwrap();
+
+        let audio2 = read::<f32>("tmp3.wav", ReadConfig::default()).unwrap();
+        assert_eq!(audio1.sample_rate, audio2.sample_rate);
+        approx::assert_abs_diff_eq!(
+            audio1.samples_interleaved.as_slice(),
+            audio2.samples_interleaved.as_slice(),
+            epsilon = 1e-4
+        );
+
+        // Clean up temporary file
+        std::fs::remove_file("tmp3.wav").expect("Failed to remove temporary test file");
     }
 
     #[test]
