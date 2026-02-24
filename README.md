@@ -1,3 +1,5 @@
+<!-- cargo-rdme start -->
+
 # audio-file
 
 A simple library to read and write audio files on your disk.
@@ -13,7 +15,7 @@ You can read most common audio formats. The default feature set enables all avai
 ```rust
 use audio_file::*;
 
-let audio = audio_read::<f32>("test.wav", AudioReadConfig::default())?;
+let audio = audio_read::<f32>("test_data/test_1ch.wav", AudioReadConfig::default())?;
 let sample_rate = audio.sample_rate;
 let num_channels = audio.num_channels;
 let samples = &audio.samples_interleaved;
@@ -22,9 +24,7 @@ let samples = &audio.samples_interleaved;
 With `audio-blocks`, you can read straight into an `AudioBlock`, which adds simple channel-based read helpers:
 
 ```rust
-use audio_file::*;
-
-let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::default())?;
+let (block, sample_rate) = audio_read_block::<f32>("test_data/test_1ch.wav", AudioReadConfig::default())?;
 ```
 
 ### Write Audio
@@ -58,7 +58,7 @@ let sample_rate = 48000;
 let block = AudioBlockInterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
 audio_write_block("tmp.wav", block, sample_rate, AudioWriteConfig::default())?;
 
-let block = AudioBlockSequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2, 3);
+let block = AudioBlockSequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
 audio_write_block("tmp.wav", block, sample_rate, AudioWriteConfig::default())?;
 ```
 
@@ -114,8 +114,10 @@ By default `Int16` is selected, for broader compatibility.
 - resample to 22.05 kHz while reading
 
 ```rust
+use audio_file::*;
+
 let audio = audio_read::<f32>(
-    "test.wav",
+    "test_data/test_1ch.wav",
     AudioReadConfig {
         sample_rate: Some(22_050),
         ..Default::default()
@@ -127,9 +129,10 @@ let audio = audio_read::<f32>(
 
 ```rust
 use std::time::Duration;
+use audio_file::*;
 
 let audio = audio_read::<f32>(
-    "test.wav",
+    "test_data/test_1ch.wav",
     AudioReadConfig {
         stop: Position::Time(Duration::from_secs_f32(0.5)),
         ..Default::default()
@@ -140,8 +143,10 @@ let audio = audio_read::<f32>(
 - read from frame 300 to 400
 
 ```rust
+use audio_file::*;
+
 let audio = audio_read::<f32>(
-    "test.wav",
+    "test_data/test_1ch.wav",
     AudioReadConfig {
         start: Position::Frame(300),
         stop: Position::Frame(400),
@@ -153,8 +158,10 @@ let audio = audio_read::<f32>(
 - read only the first two channels
 
 ```rust
+use audio_file::*;
+
 let audio = audio_read::<f32>(
-    "test.wav",
+    "test_data/test_4ch.wav",
     AudioReadConfig {
         num_channels: Some(2),
         ..Default::default()
@@ -165,8 +172,10 @@ let audio = audio_read::<f32>(
 - skip the first channel, reading channel 2 and 3
 
 ```rust
+use audio_file::*;
+
 let audio = audio_read::<f32>(
-    "test.wav",
+    "test_data/test_4ch.wav",
     AudioReadConfig {
         start_channel: Some(1),
         num_channels: Some(2),
@@ -178,6 +187,8 @@ let audio = audio_read::<f32>(
 - write audio samples in `Float32`
 
 ```rust
+use audio_file::*;
+
 audio_write(
     "tmp.wav",
     &samples_interleaved,
@@ -188,3 +199,5 @@ audio_write(
     },
 )?;
 ```
+
+<!-- cargo-rdme end -->

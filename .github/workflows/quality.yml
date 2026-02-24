@@ -63,3 +63,9 @@ jobs:
         with:
           toolchain: 1.88.0
       - run: cargo check --all-features
+
+readme:
+  name: Check if the README is up to date.
+  run: |
+    cargo install cargo-rdme
+    cargo rdme --check
