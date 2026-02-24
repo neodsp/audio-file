@@ -1,4 +1,4 @@
-# audio-io
+# audio-file
 
 A simple library to read and write audio files on your disk.
 
@@ -11,7 +11,7 @@ The library can read many formats and can write only to wav files.
 You can read most common audio formats. The default feature set enables all available codecs.
 
 ```rust
-use audio_io::*;
+use audio_file::*;
 
 let audio = audio_read::<f32>("test.wav", AudioReadConfig::default())?;
 let sample_rate = audio.sample_rate;
@@ -22,7 +22,7 @@ let samples = &audio.samples_interleaved;
 With `audio-blocks`, you can read straight into an `AudioBlock`, which adds simple channel-based read helpers:
 
 ```rust
-use audio_io::*;
+use audio_file::*;
 
 let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::default())?;
 ```
@@ -32,7 +32,7 @@ let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::
 You can only write wav files. The `audio_write` function expects interleaved samples.
 
 ```rust
-use audio_io::*;
+use audio_file::*;
 
 let sample_rate = 48000;
 let num_channels = 2;
@@ -51,7 +51,7 @@ With the `audio-blocks` feature you can write any audio layout, e.g.:
 
 ```rust
 use audio_blocks::{AudioBlockInterleavedView, AudioBlockSequentialView};
-use audio_io::*;
+use audio_file::*;
 
 let sample_rate = 48000;
 
