@@ -25,23 +25,30 @@ pub struct Audio<F> {
 }
 
 #[derive(Debug, Error)]
-pub enum AudioReadError {
+pub enum ReadError {
     #[error("could not read file")]
-    FileError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
+
     #[error("could not decode audio")]
-    EncodingError(#[from] symphonia::core::errors::Error),
-    #[error("could not find track in file")]
+    Decode(#[from] symphonia::core::errors::Error),
+
+    #[error("no track found")]
     NoTrack,
-    #[error("could not find sample rate in file")]
+
+    #[error("no sample rate found")]
     NoSampleRate,
-    #[error("end frame {0} is larger than start frame {1}")]
-    EndFrameLargerThanStartFrame(usize, usize),
-    #[error("start channel {0} invalid, audio file has only {1} channels")]
-    InvalidStartChannel(usize, usize),
-    #[error("invalid number of channels to extract: {0}")]
-    InvalidNumChannels(usize),
-    #[error("could not resample audio with specified settings")]
-    ResampleError(#[from] ResampleError),
+
+    #[error("end frame ({end}) must not exceed start frame ({start})")]
+    InvalidFrameRange { start: usize, end: usize },
+
+    #[error("start channel {index} out of bounds (file has {total} channels)")]
+    InvalidChannel { index: usize, total: usize },
+
+    #[error("invalid channel count: {0}")]
+    InvalidChannelCount(usize),
+
+    #[error("resample failed")]
+    Resample(#[from] ResampleError),
 }
 
 /// Position in the audio stream (for start or stop points)
@@ -57,7 +64,7 @@ pub enum Position {
 }
 
 #[derive(Default)]
-pub struct AudioReadConfig {
+pub struct ReadConfig {
     /// Where to start reading audio (time or frame-based)
     pub start: Position,
     /// Where to stop reading audio (time or frame-based)
@@ -70,10 +77,10 @@ pub struct AudioReadConfig {
     pub sample_rate: Option<u32>,
 }
 
-pub fn audio_read<F: Float + rubato::Sample>(
+pub fn read<F: Float + rubato::Sample>(
     path: impl AsRef<Path>,
-    config: AudioReadConfig,
-) -> Result<Audio<F>, AudioReadError> {
+    config: ReadConfig,
+) -> Result<Audio<F>, ReadError> {
     let src = File::open(path.as_ref())?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -95,12 +102,12 @@ pub fn audio_read<F: Float + rubato::Sample>(
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or(AudioReadError::NoTrack)?;
+        .ok_or(ReadError::NoTrack)?;
 
     let sample_rate = track
         .codec_params
         .sample_rate
-        .ok_or(AudioReadError::NoSampleRate)?;
+        .ok_or(ReadError::NoSampleRate)?;
 
     let track_id = track.id;
 
@@ -130,10 +137,10 @@ pub fn audio_read<F: Float + rubato::Sample>(
     if let Some(end_frame) = end_frame
         && start_frame > end_frame
     {
-        return Err(AudioReadError::EndFrameLargerThanStartFrame(
-            end_frame,
-            start_frame,
-        ));
+        return Err(ReadError::InvalidFrameRange {
+            start: start_frame,
+            end: end_frame,
+        });
     }
 
     // Optimization: Use seeking for large offsets to avoid decoding unnecessary data.
@@ -212,13 +219,16 @@ pub fn audio_read<F: Float + rubato::Sample>(
             let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
 
             if ch_start >= num_channels {
-                return Err(AudioReadError::InvalidStartChannel(ch_start, num_channels));
+                return Err(ReadError::InvalidChannel {
+                    index: ch_start,
+                    total: num_channels,
+                });
             }
             if ch_count == 0 {
-                return Err(AudioReadError::InvalidNumChannels(0));
+                return Err(ReadError::InvalidChannelCount(0));
             }
             if ch_start + ch_count > num_channels {
-                return Err(AudioReadError::InvalidNumChannels(ch_count));
+                return Err(ReadError::InvalidChannelCount(ch_count));
             }
         }
 
@@ -289,11 +299,11 @@ pub fn audio_read<F: Float + rubato::Sample>(
 }
 
 #[cfg(feature = "audio-blocks")]
-pub fn audio_read_block<F: num::Float + 'static + rubato::Sample>(
+pub fn read_block<F: num::Float + 'static + rubato::Sample>(
     path: impl AsRef<Path>,
-    config: AudioReadConfig,
-) -> Result<(audio_blocks::AudioBlockInterleaved<F>, u32), AudioReadError> {
-    let audio = audio_read(path, config)?;
+    config: ReadConfig,
+) -> Result<(audio_blocks::AudioBlockInterleaved<F>, u32), ReadError> {
+    let audio = read(path, config)?;
     Ok((
         audio_blocks::AudioBlockInterleaved::from_slice(
             &audio.samples_interleaved,
@@ -326,8 +336,7 @@ mod tests {
         const N_SAMPLES: usize = 48000;
         const FREQUENCIES: [f64; 4] = [440.0, 554.37, 659.25, 880.0];
 
-        let audio =
-            audio_read::<f32>("test_data/test_4ch.wav", AudioReadConfig::default()).unwrap();
+        let audio = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
         let block = to_block(&audio);
 
         assert_eq!(audio.sample_rate, 48000);
@@ -348,9 +357,9 @@ mod tests {
         }
 
         // Also verify reading with an offset works consistently
-        let audio = audio_read::<f32>(
+        let audio = read::<f32>(
             "test_data/test_4ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start: Position::Frame(24000),
                 stop: Position::Frame(24100),
                 ..Default::default()
@@ -376,16 +385,15 @@ mod tests {
 
     #[test]
     fn test_samples_selection() {
-        let audio1 =
-            audio_read::<f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
+        let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
         let block1 = to_block(&audio1);
         assert_eq!(audio1.sample_rate, 48000);
         assert_eq!(block1.num_frames(), 48000);
         assert_eq!(block1.num_channels(), 1);
 
-        let audio2 = audio_read::<f32>(
+        let audio2 = read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start: Position::Frame(1100),
                 stop: Position::Frame(1200),
                 ..Default::default()
@@ -401,16 +409,15 @@ mod tests {
 
     #[test]
     fn test_time_selection() {
-        let audio1 =
-            audio_read::<f32>("test_data/test_1ch.wav", AudioReadConfig::default()).unwrap();
+        let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
         let block1 = to_block(&audio1);
         assert_eq!(audio1.sample_rate, 48000);
         assert_eq!(block1.num_frames(), 48000);
         assert_eq!(block1.num_channels(), 1);
 
-        let audio2 = audio_read::<f32>(
+        let audio2 = read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start: Position::Time(Duration::from_secs_f32(0.5)),
                 stop: Position::Time(Duration::from_secs_f32(0.6)),
                 ..Default::default()
@@ -427,16 +434,15 @@ mod tests {
 
     #[test]
     fn test_channel_selection() {
-        let audio1 =
-            audio_read::<f32>("test_data/test_4ch.wav", AudioReadConfig::default()).unwrap();
+        let audio1 = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
         let block1 = to_block(&audio1);
         assert_eq!(audio1.sample_rate, 48000);
         assert_eq!(block1.num_frames(), 48000);
         assert_eq!(block1.num_channels(), 4);
 
-        let audio2 = audio_read::<f32>(
+        let audio2 = read::<f32>(
             "test_data/test_4ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start_channel: Some(1),
                 num_channels: Some(2),
                 ..Default::default()
@@ -458,60 +464,60 @@ mod tests {
 
     #[test]
     fn test_fail_selection() {
-        match audio_read::<f32>(
+        match read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start: Position::Frame(100),
                 stop: Position::Frame(99),
                 ..Default::default()
             },
         ) {
-            Err(AudioReadError::EndFrameLargerThanStartFrame(_, _)) => (),
+            Err(ReadError::InvalidFrameRange { start: _, end: _ }) => (),
             _ => panic!(),
         }
 
-        match audio_read::<f32>(
+        match read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start: Position::Time(Duration::from_secs_f32(0.6)),
                 stop: Position::Time(Duration::from_secs_f32(0.5)),
                 ..Default::default()
             },
         ) {
-            Err(AudioReadError::EndFrameLargerThanStartFrame(_, _)) => (),
+            Err(ReadError::InvalidFrameRange { start: _, end: _ }) => (),
             _ => panic!(),
         }
 
-        match audio_read::<f32>(
+        match read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start_channel: Some(1),
                 ..Default::default()
             },
         ) {
-            Err(AudioReadError::InvalidStartChannel(_, _)) => (),
+            Err(ReadError::InvalidChannel { index: _, total: _ }) => (),
             _ => panic!(),
         }
 
-        match audio_read::<f32>(
+        match read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 num_channels: Some(0),
                 ..Default::default()
             },
         ) {
-            Err(AudioReadError::InvalidNumChannels(0)) => (),
+            Err(ReadError::InvalidChannelCount(0)) => (),
             _ => panic!(),
         }
 
-        match audio_read::<f32>(
+        match read::<f32>(
             "test_data/test_1ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 num_channels: Some(2),
                 ..Default::default()
             },
         ) {
-            Err(AudioReadError::InvalidNumChannels(2)) => (),
+            Err(ReadError::InvalidChannelCount(2)) => (),
             _ => panic!(),
         }
     }
@@ -522,9 +528,9 @@ mod tests {
         let sr_out: u32 = 22050;
 
         // Read and resample in one step
-        let audio = audio_read::<f32>(
+        let audio = read::<f32>(
             "test_data/test_4ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 sample_rate: Some(sr_out),
                 ..Default::default()
             },
@@ -576,9 +582,9 @@ mod tests {
         let sr_out: u32 = 22050;
 
         // Read channels 1 and 2 (indices 1 and 2) with resampling
-        let audio = audio_read::<f32>(
+        let audio = read::<f32>(
             "test_data/test_4ch.wav",
-            AudioReadConfig {
+            ReadConfig {
                 start_channel: Some(1),
                 num_channels: Some(2),
                 sample_rate: Some(sr_out),
