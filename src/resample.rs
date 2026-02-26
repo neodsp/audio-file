@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn test_resample_preserves_frequency() {
         use crate::reader::{ReadConfig, read};
-        use audio_blocks::{AudioBlock, AudioBlockInterleavedView};
+        use audio_blocks::{AudioBlock, InterleavedView};
 
         // Read the test file
         let audio = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
@@ -71,7 +71,7 @@ mod tests {
         )
         .unwrap();
 
-        let block = AudioBlockInterleavedView::from_slice(&resampled, audio.num_channels);
+        let block = InterleavedView::from_slice(&resampled, audio.num_channels);
 
         // Expected frames after resampling: 48000 * (22050/48000) = 22050
         let expected_frames = 22050usize;

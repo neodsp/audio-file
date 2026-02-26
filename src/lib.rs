@@ -56,10 +56,10 @@
 //! # use audio_file::*;
 //! let sample_rate = 48000;
 //!
-//! let block = AudioBlockInterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
+//! let block = InterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
 //! audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 //!
-//! let block = AudioBlockSequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
+//! let block = SequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
 //! audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 //! # Ok(())
 //! # }

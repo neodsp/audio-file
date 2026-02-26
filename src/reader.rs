@@ -302,13 +302,10 @@ pub fn read<F: Float + rubato::Sample>(
 pub fn read_block<F: num::Float + 'static + rubato::Sample>(
     path: impl AsRef<Path>,
     config: ReadConfig,
-) -> Result<(audio_blocks::AudioBlockInterleaved<F>, u32), ReadError> {
+) -> Result<(audio_blocks::Interleaved<F>, u32), ReadError> {
     let audio = read(path, config)?;
     Ok((
-        audio_blocks::AudioBlockInterleaved::from_slice(
-            &audio.samples_interleaved,
-            audio.num_channels,
-        ),
+        audio_blocks::Interleaved::from_slice(&audio.samples_interleaved, audio.num_channels),
         audio.sample_rate,
     ))
 }
@@ -317,12 +314,12 @@ pub fn read_block<F: num::Float + 'static + rubato::Sample>(
 mod tests {
     use std::time::Duration;
 
-    use audio_blocks::{AudioBlock, AudioBlockInterleavedView};
+    use audio_blocks::{AudioBlock, InterleavedView};
 
     use super::*;
 
-    fn to_block<F: num::Float + 'static>(audio: &Audio<F>) -> AudioBlockInterleavedView<'_, F> {
-        AudioBlockInterleavedView::from_slice(&audio.samples_interleaved, audio.num_channels)
+    fn to_block<F: num::Float + 'static>(audio: &Audio<F>) -> InterleavedView<'_, F> {
+        InterleavedView::from_slice(&audio.samples_interleaved, audio.num_channels)
     }
 
     /// Verify that the read audio data matches the expected sine wave values.

@@ -105,7 +105,7 @@ pub fn write_block<P: AsRef<Path>, F: Float + 'static>(
     sample_rate: u32,
     config: WriteConfig,
 ) -> Result<(), WriteError> {
-    let block = audio_blocks::AudioBlockInterleaved::from_block(&audio_block);
+    let block = audio_blocks::Interleaved::from_block(&audio_block);
     write(
         path,
         block.raw_data(),

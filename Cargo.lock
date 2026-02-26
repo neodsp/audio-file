@@ -25,9 +25,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "audio-blocks"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7c5aff7883357eaa7d82b26a0a9854bf9c00014e89a962eef980c4a47ccabd9"
+checksum = "80b1cdb3f5e2e8434dd3fdd1f699d755728b9e1d4b4d0205f95bf91619283d47"
 dependencies = [
  "rtsan-standalone",
 ]
