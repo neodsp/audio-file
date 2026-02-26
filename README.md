@@ -1,4 +1,6 @@
-# audio-io
+<!-- cargo-rdme start -->
+
+# audio-file
 
 A simple library to read and write audio files on your disk.
 
@@ -10,10 +12,8 @@ The library can read many formats and can write only to wav files.
 
 You can read most common audio formats. The default feature set enables all available codecs.
 
-```rs
-use audio_io::*;
-
-let audio = audio_read::<f32>("test.wav", AudioReadConfig::default())?;
+```rust
+let audio = audio_file::read::<f32>("test_data/test_1ch.wav", audio_file::ReadConfig::default())?;
 let sample_rate = audio.sample_rate;
 let num_channels = audio.num_channels;
 let samples = &audio.samples_interleaved;
@@ -21,45 +21,37 @@ let samples = &audio.samples_interleaved;
 
 With `audio-blocks`, you can read straight into an `AudioBlock`, which adds simple channel-based read helpers:
 
-```rs
-use audio_io::*;
-
-let (block, sample_rate) = audio_read_block::<f32>("test.wav", AudioReadConfig::default())?;
+```rust
+let (block, sample_rate) = audio_file::read_block::<f32>("test_data/test_1ch.wav", audio_file::ReadConfig::default())?;
 ```
 
 ### Write Audio
 
-You can only write wav files. The `audio_write` function expects interleaved samples.
+You can only write wav files. The `audio_file::write` function expects interleaved samples.
 
-```rs
-use audio_io::*;
-
-let sample_rate = 48000;
-let num_channels = 2;
+```rust
 let samples = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]; // interleaved
-
-audio_write(
+let num_channels = 2;
+let sample_rate = 48000;
+audio_file::write(
     "tmp.wav",
     &samples,
     num_channels,
     sample_rate,
-    AudioWriteConfig::default(),
+    audio_file::WriteConfig::default(),
 )?;
 ```
 
 With the `audio-blocks` feature you can write any audio layout, e.g.:
 
-```rs
-use audio_blocks::{AudioBlockInterleavedView, AudioBlockSequentialView};
-use audio_io::*;
-
+```rust
 let sample_rate = 48000;
 
-let block = AudioBlockInterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
-audio_write_block("tmp.wav", block, sample_rate, AudioWriteConfig::default())?;
+let block = InterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
+audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 
-let block = AudioBlockSequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2, 3);
-audio_write_block("tmp.wav", block, sample_rate, AudioWriteConfig::default())?;
+let block = SequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
+audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 ```
 
 ## Supported Input Codecs
@@ -88,7 +80,7 @@ To opt out, disable default features and enable only what you need.
 Feature flags:
 
 - `all-codecs` enables all Symphonia codecs (this is the default).
-- `audio-blocks` enables `audio_read_block` and `audio_write_block`.
+- `audio-blocks` enables `read_block` and `write_block`.
 - Individual codec flags (above) enable specific formats.
 
 
@@ -106,17 +98,25 @@ The crate will try to decode and store only the parts that you selected.
 
 ### Writing
 
-For writing audio you can only select to store the audio in `Int16` or `Float32`.
-By default `Int16` is selected, for broader compatibility.
+For writing audio you can select from the following sample formats:
+
+| Format | Description |
+|--------|-------------|
+| `Int8` | 8-bit integer |
+| `Int16` | 16-bit integer (default) |
+| `Int32` | 32-bit integer |
+| `Float32` | 32-bit float |
+
+`Int16` is the default, for broader compatibility.
 
 ### Some example configs:
 
 - resample to 22.05 kHz while reading
 
-```rs
-let audio = audio_read::<f32>(
-    "test.wav",
-    AudioReadConfig {
+```rust
+let audio = audio_file::read::<f32>(
+    "test_data/test_1ch.wav",
+    audio_file::ReadConfig {
         sample_rate: Some(22_050),
         ..Default::default()
     },
@@ -125,13 +125,11 @@ let audio = audio_read::<f32>(
 
 - read the first 0.5 seconds
 
-```rs
-use std::time::Duration;
-
-let audio = audio_read::<f32>(
-    "test.wav",
-    AudioReadConfig {
-        stop: Position::Time(Duration::from_secs_f32(0.5)),
+```rust
+let audio = audio_file::read::<f32>(
+    "test_data/test_1ch.wav",
+    audio_file::ReadConfig {
+        stop: audio_file::Position::Time(Duration::from_secs_f32(0.5)),
         ..Default::default()
     },
 )?;
@@ -139,12 +137,12 @@ let audio = audio_read::<f32>(
 
 - read from frame 300 to 400
 
-```rs
-let audio = audio_read::<f32>(
-    "test.wav",
-    AudioReadConfig {
-        start: Position::Frame(300),
-        stop: Position::Frame(400),
+```rust
+let audio = audio_file::read::<f32>(
+    "test_data/test_1ch.wav",
+    audio_file::ReadConfig {
+        start: audio_file::Position::Frame(300),
+        stop: audio_file::Position::Frame(400),
         ..Default::default()
     },
 )?;
@@ -152,10 +150,10 @@ let audio = audio_read::<f32>(
 
 - read only the first two channels
 
-```rs
-let audio = audio_read::<f32>(
-    "test.wav",
-    AudioReadConfig {
+```rust
+let audio = audio_file::read::<f32>(
+    "test_data/test_4ch.wav",
+    audio_file::ReadConfig {
         num_channels: Some(2),
         ..Default::default()
     },
@@ -164,10 +162,10 @@ let audio = audio_read::<f32>(
 
 - skip the first channel, reading channel 2 and 3
 
-```rs
-let audio = audio_read::<f32>(
-    "test.wav",
-    AudioReadConfig {
+```rust
+let audio = audio_file::read::<f32>(
+    "test_data/test_4ch.wav",
+    audio_file::ReadConfig {
         start_channel: Some(1),
         num_channels: Some(2),
         ..Default::default()
@@ -177,14 +175,16 @@ let audio = audio_read::<f32>(
 
 - write audio samples in `Float32`
 
-```rs
-audio_write(
+```rust
+audio_file::write(
     "tmp.wav",
     &samples_interleaved,
     num_channels,
     sample_rate,
-    AudioWriteConfig {
-        sample_format: WriteSampleFormat::Float32,
+    audio_file::WriteConfig {
+        sample_format: audio_file::SampleFormat::Float32,
     },
 )?;
 ```
+
+<!-- cargo-rdme end -->

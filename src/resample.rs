@@ -7,9 +7,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ResampleError {
     #[error("could not create resampler")]
-    ResamplerConstructionError(#[from] rubato::ResamplerConstructionError),
+    Construction(#[from] rubato::ResamplerConstructionError),
     #[error("could not resample audio")]
-    ResampleError(#[from] rubato::ResampleError),
+    Process(#[from] rubato::ResampleError),
 }
 
 pub fn resample<F: Float + rubato::Sample>(
@@ -52,12 +52,11 @@ mod tests {
 
     #[test]
     fn test_resample_preserves_frequency() {
-        use crate::reader::{AudioReadConfig, audio_read};
-        use audio_blocks::{AudioBlock, AudioBlockInterleavedView};
+        use crate::reader::{ReadConfig, read};
+        use audio_blocks::{AudioBlock, InterleavedView};
 
         // Read the test file
-        let audio =
-            audio_read::<f32>("test_data/test_4ch.wav", AudioReadConfig::default()).unwrap();
+        let audio = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
 
         assert_eq!(audio.sample_rate, 48000);
         assert_eq!(audio.num_channels, 4);
@@ -72,7 +71,7 @@ mod tests {
         )
         .unwrap();
 
-        let block = AudioBlockInterleavedView::from_slice(&resampled, audio.num_channels);
+        let block = InterleavedView::from_slice(&resampled, audio.num_channels);
 
         // Expected frames after resampling: 48000 * (22050/48000) = 22050
         let expected_frames = 22050usize;
