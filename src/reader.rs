@@ -281,7 +281,9 @@ pub fn read<F: Float + rubato::Sample>(
     let ch_start = start_channel.unwrap_or(0);
     let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
 
-    let samples = if let Some(sr_out) = config.sample_rate {
+    let samples = if let Some(sr_out) = config.sample_rate
+        && sr_out != sample_rate
+    {
         // Use ch_count (the selected channels) not num_channels (original file channels)
         resample(&samples, ch_count, sample_rate, sr_out)?
     } else {
