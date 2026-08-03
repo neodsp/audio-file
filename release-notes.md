@@ -15,11 +15,11 @@
   crate:
   - `InvalidChannel { index, total }` is now
     `InvalidStartChannel { start, total }`.
-  - `InvalidChannelCount(usize)` is now `ZeroChannels`, matching
-    `WriteError::ZeroChannels` and `ResampleError::ZeroChannels`. A zero channel
-    count was the only case it ever reported. A channel range that exceeds the
-    channel count of the file now returns the new `InvalidChannelRange` variant,
-    which also reports the offending range.
+  - `InvalidChannelCount(usize)` is split in two. A zero channel count now
+    returns `ZeroChannels`, matching `WriteError::ZeroChannels` and
+    `ResampleError::ZeroChannels`, and a channel range that exceeds the channel
+    count of the file returns the new `InvalidChannelRange` variant, which also
+    reports the offending range.
 - `ReadError`, `WriteError`, and `ResampleError` are now `#[non_exhaustive]`, so
   a `match` over them needs a wildcard arm. In exchange, variants added in later
   releases are no longer breaking changes.
@@ -40,9 +40,10 @@
 - Support for chained streams (e.g. concatenated OGG files): the decoder is
   rebuilt when the track list changes, and the timeline continues across
   streams.
-- The sample rate is now checked against every decoded packet, not only when the
-  track list changes. A stream that switches its sample rate mid-file fails with
-  `SampleRateChanged` instead of returning audio that plays at the wrong rate.
+- The sample rate is checked against every decoded packet, and against the track
+  list of a chained stream. A file that switches its sample rate mid-stream now
+  fails with `SampleRateChanged` instead of returning audio that plays at the
+  wrong rate.
 - Integer sample conversion when writing now rounds to the nearest integer
   instead of truncating towards zero, and clamps to the symmetric range
   `[-max, max]`. This also fixes full-scale input turning into silence when
@@ -74,11 +75,10 @@
 
 - A `stop` position no longer bypasses resampling when a target sample rate is
   set.
-- A `start_channel` beyond the channel count of the file no longer overflows
-  while defaulting the channel count to "all remaining channels".
-- A `num_channels` selection close to `usize::MAX` no longer overflows while the
-  end of the channel range is validated, and no longer panics while the
-  resulting error is formatted. It returns `InvalidChannelRange`.
+- Channel selection no longer overflows on out-of-range input. Defaulting the
+  channel count for a `start_channel` beyond the channel count of the file
+  underflowed, and validating a `num_channels` close to `usize::MAX` overflowed.
+  Both are now reported as an error.
 - The `InvalidFrameRange` error message now correctly states that the start
   frame must not exceed the end frame.
 - Resampling an empty selection no longer fails.
