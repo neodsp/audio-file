@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: RUSTFLAGS="-D warnings" cargo clippy
+      - run: RUSTFLAGS="-D warnings" cargo clippy --all-targets
 
   doc:
     name: 📚 Documentation
