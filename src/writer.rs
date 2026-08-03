@@ -7,6 +7,12 @@ use thiserror::Error;
 pub enum WriteError {
     #[error("could not encode audio")]
     Encode(#[from] hound::Error),
+
+    #[error("channel count must not be zero")]
+    ZeroChannels,
+
+    #[error("sample count ({samples}) is not a multiple of the channel count ({channels})")]
+    UnalignedSamples { samples: usize, channels: u16 },
 }
 
 /// Sample format for writing audio
@@ -30,6 +36,16 @@ pub struct WriteConfig {
     pub sample_format: SampleFormat,
 }
 
+/// Scale a normalized sample to an integer range.
+///
+/// Rounds to the nearest integer and clamps to `[-max, max]`, so that full scale
+/// input neither wraps nor drops out when the range is not exactly representable
+/// in the sample type.
+fn to_int<F: Float>(sample: F, max: f64) -> f64 {
+    let sample = sample.to_f64().unwrap_or(0.0).clamp(-1.0, 1.0);
+    (sample * max).round().clamp(-max, max)
+}
+
 /// Write interleaved audio samples to a WAV file
 pub fn write<F: Float>(
     path: impl AsRef<Path>,
@@ -38,6 +54,16 @@ pub fn write<F: Float>(
     sample_rate: u32,
     config: WriteConfig,
 ) -> Result<(), WriteError> {
+    if num_channels == 0 {
+        return Err(WriteError::ZeroChannels);
+    }
+    if !samples.len().is_multiple_of(num_channels as usize) {
+        return Err(WriteError::UnalignedSamples {
+            samples: samples.len(),
+            channels: num_channels,
+        });
+    }
+
     let spec = hound::WavSpec {
         channels: num_channels,
         sample_rate,
@@ -60,29 +86,17 @@ pub fn write<F: Float>(
     match config.sample_format {
         SampleFormat::Int8 => {
             for &sample in samples {
-                let sample_i8 = (sample.clamp(F::one().neg(), F::one())
-                    * F::from(i8::MAX).unwrap_or(F::zero()))
-                .to_i8()
-                .unwrap_or(0);
-                writer.write_sample(sample_i8)?;
+                writer.write_sample(to_int(sample, i8::MAX as f64) as i8)?;
             }
         }
         SampleFormat::Int16 => {
             for &sample in samples {
-                let sample_i16 = (sample.clamp(F::one().neg(), F::one())
-                    * F::from(i16::MAX).unwrap_or(F::zero()))
-                .to_i16()
-                .unwrap_or(0);
-                writer.write_sample(sample_i16)?;
+                writer.write_sample(to_int(sample, i16::MAX as f64) as i16)?;
             }
         }
         SampleFormat::Int32 => {
             for &sample in samples {
-                let sample_i32 = (sample.clamp(F::one().neg(), F::one())
-                    * F::from(i32::MAX).unwrap_or(F::zero()))
-                .to_i32()
-                .unwrap_or(0);
-                writer.write_sample(sample_i32)?;
+                writer.write_sample(to_int(sample, i32::MAX as f64) as i32)?;
             }
         }
         SampleFormat::Float32 => {
@@ -209,6 +223,62 @@ mod tests {
 
         // Clean up temporary file
         std::fs::remove_file("tmp3.wav").expect("Failed to remove temporary test file");
+    }
+
+    #[test]
+    fn test_invalid_input_is_rejected() {
+        use super::*;
+
+        match write::<f32>("tmp_invalid.wav", &[0.0], 0, 48000, WriteConfig::default()) {
+            Err(WriteError::ZeroChannels) => (),
+            other => panic!("{other:?}"),
+        }
+
+        match write::<f32>(
+            "tmp_invalid.wav",
+            &[0.0, 0.0, 0.0],
+            2,
+            48000,
+            WriteConfig::default(),
+        ) {
+            Err(WriteError::UnalignedSamples {
+                samples: 3,
+                channels: 2,
+            }) => (),
+            other => panic!("{other:?}"),
+        }
+
+        // Both are rejected before the file is created
+        assert!(!std::path::Path::new("tmp_invalid.wav").exists());
+    }
+
+    /// Full scale samples must not wrap around or drop out, which happens when
+    /// the integer range is not exactly representable in the sample type.
+    #[test]
+    fn test_full_scale_round_trip() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = "tmp_full_scale.wav";
+        let samples = [1.0f32, -1.0, 0.5, -0.5, 0.0];
+
+        for sample_format in [
+            SampleFormat::Int8,
+            SampleFormat::Int16,
+            SampleFormat::Int32,
+            SampleFormat::Float32,
+        ] {
+            write(path, &samples, 1, 48000, WriteConfig { sample_format }).unwrap();
+            let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+
+            approx::assert_abs_diff_eq!(
+                samples.as_slice(),
+                audio.samples_interleaved.as_slice(),
+                epsilon = 1e-2
+            );
+        }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

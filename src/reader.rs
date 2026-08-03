@@ -2,13 +2,15 @@ use std::fs::File;
 use std::path::Path;
 
 use num::Float;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::audio::Channels;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::errors::Error;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::units::{TimeBase, Timestamp};
 use thiserror::Error;
 
 use crate::resample::{ResampleError, resample};
@@ -38,7 +40,13 @@ pub enum ReadError {
     #[error("no sample rate found")]
     NoSampleRate,
 
-    #[error("end frame ({end}) must not exceed start frame ({start})")]
+    #[error("could not determine the number of channels")]
+    NoChannels,
+
+    #[error("channel count ({0}) exceeds the supported maximum of 65535")]
+    TooManyChannels(usize),
+
+    #[error("start frame ({start}) must not exceed end frame ({end})")]
     InvalidFrameRange { start: usize, end: usize },
 
     #[error("start channel {index} out of bounds (file has {total} channels)")]
@@ -46,6 +54,19 @@ pub enum ReadError {
 
     #[error("invalid channel count: {0}")]
     InvalidChannelCount(usize),
+
+    #[error("channel range {start}..{} out of bounds (file has {total} channels)", .start + .count)]
+    InvalidChannelRange {
+        start: usize,
+        count: usize,
+        total: usize,
+    },
+
+    #[error("channel count changed mid-stream (was {expected}, now {found})")]
+    ChannelCountChanged { expected: usize, found: usize },
+
+    #[error("sample rate changed mid-stream (was {expected}, now {found})")]
+    SampleRateChanged { expected: u32, found: u32 },
 
     #[error("resample failed")]
     Resample(#[from] ResampleError),
@@ -65,9 +86,9 @@ pub enum Position {
 
 #[derive(Default)]
 pub struct ReadConfig {
-    /// Where to start reading audio (time or frame-based)
+    /// Where to start reading audio (time or frame-based), inclusive
     pub start: Position,
-    /// Where to stop reading audio (time or frame-based)
+    /// Where to stop reading audio (time or frame-based), exclusive
     pub stop: Position,
     /// Starting channel to extract (0-indexed). None means start from channel 0.
     pub start_channel: Option<usize>,
@@ -77,62 +98,119 @@ pub struct ReadConfig {
     pub sample_rate: Option<u32>,
 }
 
+/// Upper bound for the pre-allocation derived from the container metadata, so
+/// that a bogus frame count cannot request a huge allocation up front. The
+/// buffer still grows beyond this if the file really is that long.
+const MAX_PREALLOC_SAMPLES: usize = 16 * 1024 * 1024;
+
+/// Read an audio file from disk.
+///
+/// Only the selected range is decoded and stored. `F` is the sample type of the
+/// returned audio, either `f32` or `f64`, normalized to `[-1.0, 1.0]`.
+///
+/// The `stop` position of [`ReadConfig`] is exclusive, so reading from frame 100
+/// to frame 200 yields 100 frames. A `start` position beyond the end of the file
+/// yields no samples.
 pub fn read<F: Float + rubato::Sample>(
     path: impl AsRef<Path>,
     config: ReadConfig,
 ) -> Result<Audio<F>, ReadError> {
-    let src = File::open(path.as_ref())?;
+    let decoded = decode::<F>(path.as_ref(), &config)?;
+
+    let samples = match config.sample_rate {
+        Some(sr_out) if sr_out != decoded.sample_rate => resample(
+            &decoded.samples,
+            decoded.num_channels,
+            decoded.sample_rate,
+            sr_out,
+        )?,
+        _ => decoded.samples,
+    };
+
+    Ok(Audio {
+        samples_interleaved: samples,
+        sample_rate: config.sample_rate.unwrap_or(decoded.sample_rate),
+        num_channels: u16::try_from(decoded.num_channels)
+            .map_err(|_| ReadError::TooManyChannels(decoded.num_channels))?,
+    })
+}
+
+/// Decoded audio at the sample rate of the file, before any resampling.
+struct Decoded<F> {
+    samples: Vec<F>,
+    num_channels: usize,
+    sample_rate: u32,
+}
+
+/// Channel layout of the decoded stream, resolved against the read config.
+#[derive(Clone, Copy)]
+struct Layout {
+    /// Channels per frame in the file
+    total: usize,
+    /// First channel to extract
+    start: usize,
+    /// Number of channels to extract
+    count: usize,
+}
+
+/// The audio track that is being read, with its parameters detached from the
+/// format reader so that the reader can be borrowed mutably again.
+struct TrackInfo {
+    id: u32,
+    params: AudioCodecParameters,
+    sample_rate: u32,
+    channels: Option<usize>,
+    time_base: Option<TimeBase>,
+    num_frames: Option<u64>,
+}
+
+/// Pick the audio track to read.
+///
+/// Prefers the track the container marks as default, and falls back to the first
+/// audio track with a codec that can be decoded.
+fn select_track(format: &dyn FormatReader) -> Result<TrackInfo, ReadError> {
+    let track = format
+        .default_track(TrackType::Audio)
+        .filter(|track| track.codec_params.is_some())
+        .or_else(|| format.first_track_known_codec(TrackType::Audio))
+        .ok_or(ReadError::NoTrack)?;
+
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(CodecParameters::audio)
+        .ok_or(ReadError::NoTrack)?;
+
+    Ok(TrackInfo {
+        id: track.id,
+        sample_rate: params.sample_rate.ok_or(ReadError::NoSampleRate)?,
+        channels: params.channels.as_ref().map(Channels::count),
+        params: params.clone(),
+        time_base: track.time_base,
+        num_frames: track.num_frames,
+    })
+}
+
+fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, ReadError> {
+    let src = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
     let mut hint = Hint::new();
-    if let Some(ext) = path.as_ref().extension()
-        && let Some(ext_str) = ext.to_str()
-    {
-        hint.with_extension(ext_str);
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        hint.with_extension(ext);
     }
 
     let meta_opts: MetadataOptions = Default::default();
     let fmt_opts: FormatOptions = Default::default();
 
-    let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
+    let mut format = symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts)?;
 
-    let mut format = probed.format;
-
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or(ReadError::NoTrack)?;
-
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or(ReadError::NoSampleRate)?;
-
-    let track_id = track.id;
-
-    // Clone codec params before the mutable borrow
-    let codec_params = track.codec_params.clone();
-    let time_base = track.codec_params.time_base;
+    let mut track = select_track(&*format)?;
+    let sample_rate = track.sample_rate;
 
     // Convert start/stop positions to frame numbers
-    let start_frame = match config.start {
-        Position::Default => 0,
-        Position::Time(duration) => {
-            let secs = duration.as_secs_f64();
-            (secs * sample_rate as f64) as usize
-        }
-        Position::Frame(frame) => frame,
-    };
-
-    let end_frame: Option<usize> = match config.stop {
-        Position::Default => None,
-        Position::Time(duration) => {
-            let secs = duration.as_secs_f64();
-            Some((secs * sample_rate as f64) as usize)
-        }
-        Position::Frame(frame) => Some(frame),
-    };
+    let start_frame = position_to_frame(config.start, sample_rate).unwrap_or(0);
+    let end_frame = position_to_frame(config.stop, sample_rate);
 
     if let Some(end_frame) = end_frame
         && start_frame > end_frame
@@ -143,161 +221,272 @@ pub fn read<F: Float + rubato::Sample>(
         });
     }
 
-    // Optimization: Use seeking for large offsets to avoid decoding unnecessary data.
-    // For small offsets (< 1 second), we decode from the beginning and discard samples,
-    // which is simpler and avoids seek complexity. This threshold balances simplicity
-    // with performance - seeking has overhead and keyframe alignment issues that make
-    // it inefficient for small offsets.
-    if start_frame > sample_rate as usize
-        && let Some(tb) = time_base
-    {
-        // Seek to 90% of the target to account for keyframe positioning
-        let seek_sample = (start_frame as f64 * 0.9) as u64;
-        let seek_ts = (seek_sample * tb.denom as u64) / (sample_rate as u64);
+    // Validate the channel selection up front when the container declares a
+    // channel count. That way an invalid selection is rejected before anything
+    // is decoded, and also for files that contain no audio packets at all.
+    let declared = track
+        .channels
+        .map(|total| channel_range(config, total))
+        .transpose()?;
 
-        // Try to seek, but don't fail if seeking doesn't work
+    // Seek for large offsets to avoid decoding data that is thrown away again.
+    // Below one second the seek overhead is not worth it, and decoding from the
+    // beginning while discarding samples is simpler.
+    if start_frame > sample_rate as usize
+        && let Some(tb) = track.time_base
+    {
+        // An accurate seek always lands at or before the requested position, but
+        // aim one second early anyway to give codecs with inter-frame
+        // dependencies time to warm up. The frames in between are discarded
+        // while decoding.
+        let target = start_frame.saturating_sub(sample_rate as usize) as u64;
+        let ts = i64::try_from(frames_to_ts(target, tb, sample_rate)).unwrap_or(i64::MAX);
+
+        // Try to seek, but don't fail if seeking doesn't work. The stream
+        // position is recovered from the packet timestamps either way.
         let _ = format.seek(
             SeekMode::Accurate,
-            SeekTo::TimeStamp {
-                ts: seek_ts,
-                track_id,
+            SeekTo::Timestamp {
+                ts: Timestamp::new(ts),
+                track_id: track.id,
             },
         );
     }
 
-    let dec_opts: DecoderOptions = Default::default();
-    let mut decoder = symphonia::default::get_codecs().make(&codec_params, &dec_opts)?;
+    let dec_opts: AudioDecoderOptions = Default::default();
+    let mut decoder =
+        symphonia::default::get_codecs().make_audio_decoder(&track.params, &dec_opts)?;
 
-    let mut sample_buf = None;
-    let mut samples = Vec::new();
-    let mut num_channels = 0usize;
-    let start_channel = config.start_channel;
+    let mut samples: Vec<F> = Vec::new();
+    let mut layout: Option<Layout> = None;
 
-    // We'll track exact position by counting samples as we decode
-    let mut current_sample: Option<u64> = None;
+    // Reused per packet to hold the selected frames of the decoded audio.
+    // `f64` is used because it can hold every sample format symphonia decodes
+    // to without losing precision.
+    let mut scratch: Vec<f64> = Vec::new();
+
+    // Reserve up front when the container reports a frame count, so that long
+    // reads don't repeatedly reallocate a growing buffer.
+    if let Some((_, ch_count)) = declared
+        && let Some(frames) = expected_frames(start_frame, end_frame, track.num_frames)
+    {
+        samples.reserve(frames.saturating_mul(ch_count).min(MAX_PREALLOC_SAMPLES));
+    }
+
+    // Absolute frame index of the next frame to be decoded. Streams with a time
+    // base take their position from the packet timestamps instead, and only use
+    // this to continue the timeline across a chained stream.
+    let mut position: Option<u64> = None;
+
+    // Offset applied to packet timestamps. Stays zero unless a chained stream
+    // restarts its timestamps, in which case it continues where the previous
+    // stream ended.
+    let mut stream_base = 0u64;
 
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            // The end of the media was reached.
+            Ok(None) => break,
+            // The track list changed, which happens for chained streams such as
+            // concatenated OGG files. The decoder has to be rebuilt from the new
+            // track list, and reading only continues if the new track is
+            // compatible with what has been decoded so far.
             Err(Error::ResetRequired) => {
-                decoder.reset();
+                let next = select_track(&*format)?;
+                if next.sample_rate != sample_rate {
+                    return Err(ReadError::SampleRateChanged {
+                        expected: sample_rate,
+                        found: next.sample_rate,
+                    });
+                }
+                decoder =
+                    symphonia::default::get_codecs().make_audio_decoder(&next.params, &dec_opts)?;
+                track = next;
+                // The new stream restarts its timestamps at zero, so continue
+                // the timeline where the previous stream ended.
+                stream_base = position.unwrap_or(0);
                 continue;
-            }
-            Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
             }
             Err(err) => return Err(err.into()),
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track.id {
             continue;
         }
 
-        let decoded = decoder.decode(&packet)?;
+        // Frames before the presentation timestamp are encoder delay that the
+        // decoder discards, so the trimmed buffer starts at `pts + trim_start`.
+        let packet_ts = packet
+            .pts
+            .get()
+            .saturating_add_unsigned(packet.trim_start.get())
+            .max(0) as u64;
 
-        // Get the timestamp of this packet to know our position
-        if current_sample.is_none() {
-            let ts = packet.ts();
-            if let Some(tb) = time_base {
-                // Convert timestamp to sample position
-                current_sample = Some((ts * sample_rate as u64) / tb.denom as u64);
-            } else {
-                current_sample = Some(0);
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            // A malformed packet is discardable and decoding may continue with
+            // the next one, but only if the position can be recovered from its
+            // timestamp. Without a time base the discarded frames would shift
+            // everything that follows, so the error is propagated instead.
+            Err(Error::DecodeError(_) | Error::IoError(_)) if track.time_base.is_some() => {
+                continue;
             }
-        }
+            // The audio specification of the decoded audio may change after a
+            // reset, which is picked up from the next packet.
+            Err(Error::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
 
-        if sample_buf.is_none() {
-            let spec = *decoded.spec();
-            let duration = decoded.capacity() as u64;
-            sample_buf = Some(SampleBuffer::<f32>::new(duration, spec));
-
-            // Get the number of channels from the spec
-            num_channels = spec.channels.count();
-
-            // Validate channel range
-            let ch_start = start_channel.unwrap_or(0);
-            let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
-
-            if ch_start >= num_channels {
-                return Err(ReadError::InvalidChannel {
-                    index: ch_start,
-                    total: num_channels,
+        // The decoded specification is authoritative for the channel count, the
+        // container hint may disagree with it.
+        let total_channels = decoded.spec().channels().count();
+        let layout = match layout {
+            Some(known) if known.total != total_channels => {
+                return Err(ReadError::ChannelCountChanged {
+                    expected: known.total,
+                    found: total_channels,
                 });
             }
-            if ch_count == 0 {
-                return Err(ReadError::InvalidChannelCount(0));
+            Some(known) => known,
+            None => {
+                let (start, count) = channel_range(config, total_channels)?;
+                *layout.insert(Layout {
+                    total: total_channels,
+                    start,
+                    count,
+                })
             }
-            if ch_start + ch_count > num_channels {
-                return Err(ReadError::InvalidChannelCount(ch_count));
+        };
+
+        let packet_frames = decoded.frames();
+
+        // The timestamp states where these frames belong, which is more robust
+        // than counting decoded frames: a decoder may return fewer frames than
+        // the packet covers, for example while warming up after a seek.
+        let packet_start = match track.time_base {
+            Some(tb) => stream_base + ts_to_frames(packet_ts, tb, sample_rate),
+            None => position.unwrap_or(0),
+        };
+        let packet_end = packet_start + packet_frames as u64;
+
+        // Intersect the packet with the requested frame range
+        let copy_start = packet_start.max(start_frame as u64);
+        let copy_end = match end_frame {
+            Some(end) => packet_end.min(end as u64),
+            None => packet_end,
+        };
+
+        if copy_start < copy_end {
+            let first = (copy_start - packet_start) as usize;
+            let last = (copy_end - packet_start) as usize;
+
+            // Convert whatever sample format the codec produced into the
+            // scratch buffer, then take the selected frames out of it.
+            scratch.resize(decoded.samples_interleaved(), 0.0);
+            decoded.copy_to_slice_interleaved::<f64, _>(scratch.as_mut_slice());
+            let frames = &scratch[first * layout.total..last * layout.total];
+
+            if layout.start == 0 && layout.count == layout.total {
+                // All channels are selected, so nothing has to be dropped
+                extend_samples(&mut samples, frames);
+            } else {
+                for frame in frames.chunks_exact(layout.total) {
+                    let selected = &frame[layout.start..layout.start + layout.count];
+                    extend_samples(&mut samples, selected);
+                }
             }
         }
 
-        if let Some(buf) = &mut sample_buf {
-            buf.copy_interleaved_ref(decoded);
-            let packet_samples = buf.samples();
+        position = Some(packet_end);
 
-            let mut pos = current_sample.unwrap_or(0);
-
-            // Determine channel range to extract
-            let ch_start = start_channel.unwrap_or(0);
-            let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
-            let ch_end = ch_start + ch_count;
-
-            // Calculate frames using the ORIGINAL channel count from the file
-            let frames = packet_samples.len() / num_channels;
-
-            // Process all frames, extracting only the requested channel range
-            for frame_idx in 0..frames {
-                // Check if we've reached the end frame
-                if let Some(end) = end_frame
-                    && pos >= end as u64
-                {
-                    return Ok(Audio {
-                        samples_interleaved: samples,
-                        sample_rate,
-                        num_channels: ch_count as u16,
-                    });
-                }
-
-                // Start collecting samples once we reach start_frame
-                if pos >= start_frame as u64 {
-                    // Extract the selected channel range from this frame
-                    // When ch_start=0 and ch_count=num_channels, this extracts all channels
-                    for ch in ch_start..ch_end {
-                        let sample_idx = frame_idx * num_channels + ch;
-                        samples.push(F::from(packet_samples[sample_idx]).unwrap());
-                    }
-                }
-
-                pos += 1;
-            }
-
-            // Update our position tracker
-            current_sample = Some(pos);
+        if let Some(end) = end_frame
+            && packet_end >= end as u64
+        {
+            break;
         }
     }
 
-    // Calculate the actual channel count in the extracted samples
-    let ch_start = start_channel.unwrap_or(0);
-    let ch_count = config.num_channels.unwrap_or(num_channels - ch_start);
-
-    let samples = if let Some(sr_out) = config.sample_rate
-        && sr_out != sample_rate
-    {
-        // Use ch_count (the selected channels) not num_channels (original file channels)
-        resample(&samples, ch_count, sample_rate, sr_out)?
-    } else {
-        samples
+    // Fall back to the declared channel count for files without audio packets,
+    // so that an empty selection still reports a sane layout.
+    let num_channels = match (layout, declared) {
+        (Some(layout), _) => layout.count,
+        (None, Some((_, count))) => count,
+        (None, None) => return Err(ReadError::NoChannels),
     };
 
-    // Return the actual sample rate (resampled if applicable, otherwise original)
-    let actual_sample_rate = config.sample_rate.unwrap_or(sample_rate);
-
-    Ok(Audio {
-        samples_interleaved: samples,
-        sample_rate: actual_sample_rate,
-        num_channels: ch_count as u16,
+    Ok(Decoded {
+        samples,
+        num_channels,
+        sample_rate,
     })
+}
+
+fn extend_samples<F: Float>(samples: &mut Vec<F>, src: &[f64]) {
+    // `F` is `f32` or `f64` here, so the conversion cannot fail
+    samples.extend(src.iter().map(|&s| F::from(s).unwrap_or_else(F::zero)));
+}
+
+/// Resolve and validate the requested channel range against a file with `total` channels.
+fn channel_range(config: &ReadConfig, total: usize) -> Result<(usize, usize), ReadError> {
+    let start = config.start_channel.unwrap_or(0);
+    if start >= total {
+        return Err(ReadError::InvalidChannel {
+            index: start,
+            total,
+        });
+    }
+
+    let count = config.num_channels.unwrap_or(total - start);
+    if count == 0 {
+        return Err(ReadError::InvalidChannelCount(0));
+    }
+    if start + count > total {
+        return Err(ReadError::InvalidChannelRange {
+            start,
+            count,
+            total,
+        });
+    }
+
+    Ok((start, count))
+}
+
+fn position_to_frame(position: Position, sample_rate: u32) -> Option<usize> {
+    match position {
+        Position::Default => None,
+        Position::Time(duration) => {
+            Some((duration.as_secs_f64() * sample_rate as f64).round() as usize)
+        }
+        Position::Frame(frame) => Some(frame),
+    }
+}
+
+/// Number of frames the read is expected to yield, if the file length is known.
+fn expected_frames(start: usize, end: Option<usize>, n_frames: Option<u64>) -> Option<usize> {
+    let total = n_frames.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let end = match (end, total) {
+        (Some(end), Some(total)) => end.min(total),
+        (Some(end), None) => end,
+        (None, Some(total)) => total,
+        (None, None) => return None,
+    };
+    Some(end.saturating_sub(start))
+}
+
+/// Frame index that the timestamp `ts` refers to.
+fn ts_to_frames(ts: u64, tb: TimeBase, sample_rate: u32) -> u64 {
+    let dividend = ts as u128 * u128::from(tb.numer.get()) * u128::from(sample_rate);
+    (dividend / u128::from(tb.denom.get())) as u64
+}
+
+/// Timestamp that refers to the frame at index `frame`.
+fn frames_to_ts(frame: u64, tb: TimeBase, sample_rate: u32) -> u64 {
+    let dividend = frame as u128 * u128::from(tb.denom.get());
+    (dividend / (u128::from(tb.numer.get()) * u128::from(sample_rate))) as u64
 }
 
 #[cfg(feature = "audio-blocks")]
@@ -498,6 +687,19 @@ mod tests {
             _ => panic!(),
         }
 
+        // A start channel beyond the channel count must not overflow while
+        // defaulting the channel count to "all remaining channels"
+        match read::<f32>(
+            "test_data/test_1ch.wav",
+            ReadConfig {
+                start_channel: Some(3),
+                ..Default::default()
+            },
+        ) {
+            Err(ReadError::InvalidChannel { index: 3, total: 1 }) => (),
+            other => panic!("{other:?}"),
+        }
+
         match read::<f32>(
             "test_data/test_1ch.wav",
             ReadConfig {
@@ -516,8 +718,12 @@ mod tests {
                 ..Default::default()
             },
         ) {
-            Err(ReadError::InvalidChannelCount(2)) => (),
-            _ => panic!(),
+            Err(ReadError::InvalidChannelRange {
+                start: 0,
+                count: 2,
+                total: 1,
+            }) => (),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -633,5 +839,117 @@ mod tests {
                 max_error
             );
         }
+    }
+
+    /// A stop position must not bypass the resampling step.
+    #[test]
+    fn test_stop_with_resampling() {
+        let sr_out: u32 = 24000;
+
+        let audio = read::<f32>(
+            "test_data/test_4ch.wav",
+            ReadConfig {
+                stop: Position::Frame(24000),
+                sample_rate: Some(sr_out),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(audio.sample_rate, sr_out);
+        assert_eq!(audio.num_channels, 4);
+        // 24000 frames at 48 kHz are 12000 frames at 24 kHz
+        assert_eq!(to_block(&audio).num_frames(), 12000);
+    }
+
+    /// The seek path is only taken for start offsets of more than one second.
+    #[test]
+    fn test_start_beyond_seek_threshold() {
+        let path = "tmp_read_seek.wav";
+
+        // Three seconds of a ramp, so that every frame is identifiable
+        let num_frames = 48000 * 3;
+        let mut samples = Vec::with_capacity(num_frames * 2);
+        for frame in 0..num_frames {
+            let value = frame as f32 / num_frames as f32;
+            samples.push(value);
+            samples.push(-value);
+        }
+        crate::writer::write(
+            path,
+            &samples,
+            2,
+            48000,
+            crate::writer::WriteConfig {
+                sample_format: crate::writer::SampleFormat::Float32,
+            },
+        )
+        .unwrap();
+
+        for start in [48_001, 60_000, 100_000, 143_000] {
+            let audio = read::<f32>(
+                path,
+                ReadConfig {
+                    start: Position::Frame(start),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(audio.num_channels, 2);
+            assert_eq!(
+                audio.samples_interleaved.len(),
+                (num_frames - start) * 2,
+                "wrong length for start frame {start}"
+            );
+            assert_eq!(
+                audio.samples_interleaved[..2],
+                samples[start * 2..start * 2 + 2],
+                "wrong first frame for start frame {start}"
+            );
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A file without audio frames must report the declared channel layout and
+    /// still validate the channel selection.
+    #[test]
+    fn test_read_file_without_frames() {
+        let path = "tmp_read_empty.wav";
+        crate::writer::write::<f32>(path, &[], 2, 48000, crate::writer::WriteConfig::default())
+            .unwrap();
+
+        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        assert_eq!(audio.num_channels, 2);
+        assert_eq!(audio.sample_rate, 48000);
+        assert!(audio.samples_interleaved.is_empty());
+
+        // Resampling nothing must not fail
+        let audio = read::<f32>(
+            path,
+            ReadConfig {
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(audio.num_channels, 2);
+        assert_eq!(audio.sample_rate, 24000);
+        assert!(audio.samples_interleaved.is_empty());
+
+        // An invalid selection must be rejected even without any audio frames
+        match read::<f32>(
+            path,
+            ReadConfig {
+                num_channels: Some(99),
+                ..Default::default()
+            },
+        ) {
+            Err(ReadError::InvalidChannelRange { total: 2, .. }) => (),
+            other => panic!("{other:?}"),
+        }
+
+        std::fs::remove_file(path).unwrap();
     }
 }

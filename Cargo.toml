@@ -9,20 +9,20 @@ name = "audio-file"
 readme = "README.md"
 repository = "https://github.com/neodsp/audio-file"
 rust-version = "1.88"
-version = "0.4.1"
+version = "0.5.0"
 
 [dependencies]
-approx = "0.5"
-audioadapter-buffers = "2"
+audioadapter-buffers = "4"
 hound = "3.5"
 num = "0.4"
-rubato = "1"
-symphonia = "0.5"
+rubato = "4"
+symphonia = "0.6"
 thiserror = "2"
 
 audio-blocks = { version = "0.7", optional = true }
 
 [dev-dependencies]
+approx = "0.5"
 audio-blocks = { version = "0.7" }
 
 [features]

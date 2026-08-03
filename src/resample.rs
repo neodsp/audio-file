@@ -10,19 +10,28 @@ pub enum ResampleError {
     Construction(#[from] rubato::ResamplerConstructionError),
     #[error("could not resample audio")]
     Process(#[from] rubato::ResampleError),
+    #[error("channel count must not be zero")]
+    ZeroChannels,
 }
 
+/// Resample interleaved audio from `sr_in` to `sr_out`.
 pub fn resample<F: Float + rubato::Sample>(
     audio_interleaved: &[F],
     num_channels: usize,
     sr_in: u32,
     sr_out: u32,
 ) -> Result<Vec<F>, ResampleError> {
+    if num_channels == 0 {
+        return Err(ResampleError::ZeroChannels);
+    }
+    if audio_interleaved.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut resampler = Fft::new(
         sr_in as usize,
         sr_out as usize,
         1024,
-        2,
         num_channels,
         rubato::FixedSync::Both,
     )?;

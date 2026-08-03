@@ -23,10 +23,13 @@
 //! With `audio-blocks`, you can read straight into an `AudioBlock`, which adds simple channel-based read helpers:
 //!
 //! ```rust
+//! # #[cfg(feature = "audio-blocks")]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let (block, sample_rate) = audio_file::read_block::<f32>("test_data/test_1ch.wav", audio_file::ReadConfig::default())?;
 //! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "audio-blocks"))]
+//! # fn main() {}
 //! ```
 //!
 //! ### Write Audio
@@ -39,12 +42,13 @@
 //! let num_channels = 2;
 //! let sample_rate = 48000;
 //! audio_file::write(
-//!     "tmp.wav",
+//!     "output.wav",
 //!     &samples,
 //!     num_channels,
 //!     sample_rate,
 //!     audio_file::WriteConfig::default(),
 //! )?;
+//! # std::fs::remove_file("output.wav")?;
 //! # Ok(())
 //! # }
 //! ```
@@ -52,17 +56,21 @@
 //! With the `audio-blocks` feature you can write any audio layout, e.g.:
 //!
 //! ```rust
+//! # #[cfg(feature = "audio-blocks")]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # use audio_file::*;
 //! let sample_rate = 48000;
 //!
-//! let block = InterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
-//! audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
+//! let block = Interleaved::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
+//! audio_file::write_block("output_layout.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 //!
-//! let block = SequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
-//! audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
+//! let block = Sequential::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
+//! audio_file::write_block("output_layout.wav", block, sample_rate, audio_file::WriteConfig::default())?;
+//! # std::fs::remove_file("output_layout.wav")?;
 //! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "audio-blocks"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Supported Input Codecs
@@ -105,7 +113,7 @@
 //! - Start channel and number of channels
 //! - Optional resampling
 //!
-//! The crate will try to decode and store only the parts that you selected.
+//! The crate only decodes and stores the parts that you selected.
 //!
 //! ### Writing
 //!
@@ -210,7 +218,7 @@
 //! # let num_channels = 2u16;
 //! # let sample_rate = 48000u32;
 //! audio_file::write(
-//!     "tmp.wav",
+//!     "output_float32.wav",
 //!     &samples_interleaved,
 //!     num_channels,
 //!     sample_rate,
@@ -218,6 +226,7 @@
 //!         sample_format: audio_file::SampleFormat::Float32,
 //!     },
 //! )?;
+//! # std::fs::remove_file("output_float32.wav")?;
 //! # Ok(())
 //! # }
 //! ```

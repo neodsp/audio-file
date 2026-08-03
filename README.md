@@ -34,7 +34,7 @@ let samples = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]; // interleaved
 let num_channels = 2;
 let sample_rate = 48000;
 audio_file::write(
-    "tmp.wav",
+    "output.wav",
     &samples,
     num_channels,
     sample_rate,
@@ -47,11 +47,11 @@ With the `audio-blocks` feature you can write any audio layout, e.g.:
 ```rust
 let sample_rate = 48000;
 
-let block = InterleavedView::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
-audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
+let block = Interleaved::from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2);
+audio_file::write_block("output_layout.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 
-let block = SequentialView::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
-audio_file::write_block("tmp.wav", block, sample_rate, audio_file::WriteConfig::default())?;
+let block = Sequential::from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2);
+audio_file::write_block("output_layout.wav", block, sample_rate, audio_file::WriteConfig::default())?;
 ```
 
 ## Supported Input Codecs
@@ -94,7 +94,7 @@ When reading a file you can specify the following things:
 - Start channel and number of channels
 - Optional resampling
 
-The crate will try to decode and store only the parts that you selected.
+The crate only decodes and stores the parts that you selected.
 
 ### Writing
 
@@ -177,7 +177,7 @@ let audio = audio_file::read::<f32>(
 
 ```rust
 audio_file::write(
-    "tmp.wav",
+    "output_float32.wav",
     &samples_interleaved,
     num_channels,
     sample_rate,
