@@ -27,6 +27,7 @@ pub struct Audio<F> {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReadError {
     #[error("could not read file")]
     Io(#[from] std::io::Error),
@@ -49,13 +50,15 @@ pub enum ReadError {
     #[error("start frame ({start}) must not exceed end frame ({end})")]
     InvalidFrameRange { start: usize, end: usize },
 
-    #[error("start channel {index} out of bounds (file has {total} channels)")]
-    InvalidChannel { index: usize, total: usize },
+    #[error("start channel {start} out of bounds (file has {total} channels)")]
+    InvalidStartChannel { start: usize, total: usize },
 
-    #[error("invalid channel count: {0}")]
-    InvalidChannelCount(usize),
+    #[error("channel count must not be zero")]
+    ZeroChannels,
 
-    #[error("channel range {start}..{} out of bounds (file has {total} channels)", .start + .count)]
+    #[error(
+        "channel range out of bounds: {count} channels starting at channel {start} (file has {total} channels)"
+    )]
     InvalidChannelRange {
         start: usize,
         count: usize,
@@ -260,6 +263,11 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     let mut samples: Vec<F> = Vec::new();
     let mut layout: Option<Layout> = None;
 
+    // Sample rate reported by the first decoded packet. The decoded rate is
+    // taken from the bitstream, so it may disagree with the container, but it
+    // must stay the same for every packet that follows.
+    let mut decoded_rate: Option<u32> = None;
+
     // Reused per packet to hold the selected frames of the decoded audio.
     // `f64` is used because it can hold every sample format symphonia decodes
     // to without losing precision.
@@ -341,8 +349,22 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Err(err) => return Err(err.into()),
         };
 
-        // The decoded specification is authoritative for the channel count, the
-        // container hint may disagree with it.
+        // The decoded specification is authoritative for the channel count and
+        // the sample rate, the container hint may disagree with them. Both have
+        // to stay stable, otherwise the frames of this packet do not belong to
+        // the same stream as everything that was decoded before.
+        let packet_rate = decoded.spec().rate();
+        match decoded_rate {
+            Some(known) if known != packet_rate => {
+                return Err(ReadError::SampleRateChanged {
+                    expected: known,
+                    found: packet_rate,
+                });
+            }
+            Some(_) => (),
+            None => decoded_rate = Some(packet_rate),
+        }
+
         let total_channels = decoded.spec().channels().count();
         let layout = match layout {
             Some(known) if known.total != total_channels => {
@@ -434,17 +456,16 @@ fn extend_samples<F: Float>(samples: &mut Vec<F>, src: &[f64]) {
 fn channel_range(config: &ReadConfig, total: usize) -> Result<(usize, usize), ReadError> {
     let start = config.start_channel.unwrap_or(0);
     if start >= total {
-        return Err(ReadError::InvalidChannel {
-            index: start,
-            total,
-        });
+        return Err(ReadError::InvalidStartChannel { start, total });
     }
 
     let count = config.num_channels.unwrap_or(total - start);
     if count == 0 {
-        return Err(ReadError::InvalidChannelCount(0));
+        return Err(ReadError::ZeroChannels);
     }
-    if start + count > total {
+    // The end of the range is only needed for this comparison, and a requested
+    // count close to `usize::MAX` would overflow while calculating it.
+    if start.checked_add(count).is_none_or(|end| end > total) {
         return Err(ReadError::InvalidChannelRange {
             start,
             count,
@@ -683,7 +704,7 @@ mod tests {
                 ..Default::default()
             },
         ) {
-            Err(ReadError::InvalidChannel { index: _, total: _ }) => (),
+            Err(ReadError::InvalidStartChannel { start: _, total: _ }) => (),
             _ => panic!(),
         }
 
@@ -696,7 +717,7 @@ mod tests {
                 ..Default::default()
             },
         ) {
-            Err(ReadError::InvalidChannel { index: 3, total: 1 }) => (),
+            Err(ReadError::InvalidStartChannel { start: 3, total: 1 }) => (),
             other => panic!("{other:?}"),
         }
 
@@ -707,7 +728,7 @@ mod tests {
                 ..Default::default()
             },
         ) {
-            Err(ReadError::InvalidChannelCount(0)) => (),
+            Err(ReadError::ZeroChannels) => (),
             _ => panic!(),
         }
 
@@ -725,6 +746,31 @@ mod tests {
             }) => (),
             other => panic!("{other:?}"),
         }
+
+        // A channel count that overflows the end of the range must be reported
+        // instead of overflowing while validating or formatting it
+        let error = read::<f32>(
+            "test_data/test_4ch.wav",
+            ReadConfig {
+                start_channel: Some(1),
+                num_channels: Some(usize::MAX),
+                ..Default::default()
+            },
+        )
+        .expect_err("a channel count of usize::MAX must be rejected");
+
+        assert!(
+            matches!(
+                error,
+                ReadError::InvalidChannelRange {
+                    start: 1,
+                    count: usize::MAX,
+                    total: 4,
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

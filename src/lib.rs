@@ -73,7 +73,7 @@
 //! # fn main() {}
 //! ```
 //!
-//! ## Supported Input Codecs
+//! ## Supported Input Formats
 //!
 //! Default features enable all codecs (including royalty-encumbered formats) via `all-codecs`.
 //! To opt out, disable default features and enable only what you need.
@@ -115,6 +115,10 @@
 //!
 //! The crate only decodes and stores the parts that you selected.
 //!
+//! The start position is inclusive and the stop position is exclusive, so reading from frame 300
+//! to frame 400 yields 100 frames. Frame 0 is the first playable frame: encoder delay and padding,
+//! as used by formats like MP3, are not part of the timeline.
+//!
 //! ### Writing
 //!
 //! For writing audio you can select from the following sample formats:
@@ -122,11 +126,9 @@
 //! | Format | Description |
 //! |--------|-------------|
 //! | `Int8` | 8-bit integer |
-//! | `Int16` | 16-bit integer (default) |
+//! | `Int16` | 16-bit integer (default, for the broadest compatibility) |
 //! | `Int32` | 32-bit integer |
 //! | `Float32` | 32-bit float |
-//!
-//! `Int16` is the default, for broader compatibility.
 //!
 //! ### Some example configs:
 //!

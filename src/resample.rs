@@ -5,6 +5,7 @@ use rubato::Resampler as _;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ResampleError {
     #[error("could not create resampler")]
     Construction(#[from] rubato::ResamplerConstructionError),

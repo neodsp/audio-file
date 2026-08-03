@@ -4,6 +4,7 @@ use num::Float;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum WriteError {
     #[error("could not encode audio")]
     Encode(#[from] hound::Error),

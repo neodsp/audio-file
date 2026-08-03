@@ -1,19 +1,34 @@
 ## Breaking Changes
 
-- Upgraded to `symphonia` 0.6, `rubato` 4, and `audioadapter-buffers` 4.
+- Upgraded to `symphonia` 0.6 and `rubato` 4. Both are part of the public API,
+  through `ReadError::Decode`, the `ResampleError` variants, and the
+  `rubato::Sample` bound on `read`, `read_block`, and `resample`, so callers
+  have to move to the same major versions.
 - Time-based `start`/`stop` positions are now rounded to the nearest frame
   instead of being truncated. A selection can therefore shift by one frame
   compared to 0.4.x.
-- Requesting a channel range that exceeds the channel count of the file now
-  returns the new `ReadError::InvalidChannelRange` variant instead of
-  `ReadError::InvalidChannelCount`, and also reports the offending range.
-- `approx` is no longer a public dependency; it is only used in tests.
+- The audio track is now selected by asking the container for its default audio
+  track, falling back to the first audio track with a known codec. Previously
+  the first track with a non-null codec was used, so a file with several audio
+  tracks may now read a different one.
+- Two `ReadError` variants were renamed, for consistency with the rest of the
+  crate:
+  - `InvalidChannel { index, total }` is now
+    `InvalidStartChannel { start, total }`.
+  - `InvalidChannelCount(usize)` is now `ZeroChannels`, matching
+    `WriteError::ZeroChannels` and `ResampleError::ZeroChannels`. A zero channel
+    count was the only case it ever reported. A channel range that exceeds the
+    channel count of the file now returns the new `InvalidChannelRange` variant,
+    which also reports the offending range.
+- `ReadError`, `WriteError`, and `ResampleError` are now `#[non_exhaustive]`, so
+  a `match` over them needs a wildcard arm. In exchange, variants added in later
+  releases are no longer breaking changes.
 
 ## Improvements
 
-- Frame positions now refer to playable audio: encoder delay and padding, as
-  used by formats like MP3, are trimmed, so frame 0 is the first playable
-  frame. The `stop` position is exclusive.
+- Frame positions now account for encoder delay and padding, as used by formats
+  like MP3. The trimmed frames are excluded from the timeline, so frame 0 is the
+  first playable frame.
 - Reading is now positioned by packet timestamps instead of counting decoded
   frames, which makes frame-accurate reads robust against decoders that return
   fewer frames than a packet covers (e.g. while warming up after a seek).
@@ -25,21 +40,34 @@
 - Support for chained streams (e.g. concatenated OGG files): the decoder is
   rebuilt when the track list changes, and the timeline continues across
   streams.
-- Integer sample conversion when writing now rounds to the nearest integer and
-  clamps to the symmetric range `[-max, max]`, so full-scale input neither
-  wraps around nor drops out.
+- The sample rate is now checked against every decoded packet, not only when the
+  track list changes. A stream that switches its sample rate mid-file fails with
+  `SampleRateChanged` instead of returning audio that plays at the wrong rate.
+- Integer sample conversion when writing now rounds to the nearest integer
+  instead of truncating towards zero, and clamps to the symmetric range
+  `[-max, max]`. This also fixes full-scale input turning into silence when
+  writing `Int32` from `f32` samples, where the scale factor rounded up out of
+  the `i32` range.
 - Channel selection is validated up front, so an invalid selection is rejected
   even for files that contain no audio packets.
 - Files without audio frames now report the channel layout declared by the
   container instead of failing.
+- The output buffer is reserved up front from the frame count reported by the
+  container, so a long read no longer reallocates repeatedly while decoding.
+- The documentation now states that `start` is inclusive and `stop` is
+  exclusive, so reading from frame 300 to frame 400 yields 100 frames. This has
+  always been the behavior.
+- Dependency housekeeping: the internal `audioadapter-buffers` dependency moved
+  to 4, and `approx` moved to the dev-dependencies. Neither is part of the
+  public API.
 
 ## New Error Variants
 
-- `ReadError`: `NoChannels`, `InvalidChannelRange`, `ChannelCountChanged`,
-  `SampleRateChanged`
-- `WriteError`: `ZeroChannels`, `UnalignedSamples`: writing with zero channels
-  or a sample count that is not a multiple of the channel count is now rejected
-  before the file is created.
+- `ReadError`: `NoChannels`, `TooManyChannels`, `InvalidChannelRange`,
+  `ChannelCountChanged`, `SampleRateChanged`
+- `WriteError`: `ZeroChannels` and `UnalignedSamples`. Writing with zero
+  channels or a sample count that is not a multiple of the channel count is now
+  rejected before the file is created.
 - `ResampleError`: `ZeroChannels`
 
 ## Fixes
@@ -48,6 +76,9 @@
   set.
 - A `start_channel` beyond the channel count of the file no longer overflows
   while defaulting the channel count to "all remaining channels".
+- A `num_channels` selection close to `usize::MAX` no longer overflows while the
+  end of the channel range is validated, and no longer panics while the
+  resulting error is formatted. It returns `InvalidChannelRange`.
 - The `InvalidFrameRange` error message now correctly states that the start
   frame must not exceed the end frame.
 - Resampling an empty selection no longer fails.
