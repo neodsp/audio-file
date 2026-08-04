@@ -72,7 +72,7 @@ Acceptance criteria:
 - Document any convention change in the release process.
 - Verify the workflow against both a matching tag and a mismatched tag.
 
-### [ ] Make reduced-feature CI actually disable Symphonia defaults
+### [x] Make reduced-feature CI actually disable Symphonia defaults
 
 **Priority:** Medium  
 **Relevant code:** `Cargo.toml:19`, `.github/workflows/tests.yml:28`
@@ -111,7 +111,7 @@ After completing the tasks above, run:
 - [ ] `cargo test --locked --all-features --all-targets --workspace`
 - [ ] `cargo test --locked --doc --workspace`
 - [ ] `cargo test --locked --all-features --doc --workspace`
-- [ ] Reduced-feature tests with Symphonia defaults genuinely disabled
+- [x] Reduced-feature tests with Symphonia defaults genuinely disabled
 - [ ] Compressed-format range regression tests
 - [ ] `cargo doc --locked --all-features --no-deps`
 - [ ] `cargo package --locked --allow-dirty`

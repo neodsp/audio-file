@@ -16,7 +16,7 @@ audioadapter-buffers = "4"
 hound = "3.5"
 num = "0.4"
 rubato = "4"
-symphonia = "0.6"
+symphonia = { version = "0.6", default-features = false }
 thiserror = "2"
 
 audio-blocks = { version = "0.7", optional = true }
@@ -26,13 +26,16 @@ approx = "0.5"
 audio-blocks = { version = "0.7" }
 
 [features]
-default = ["all-codecs"]
+default = ["all-codecs", "simd"]
 
 # Add utility functions for channel access etc
 audio-blocks = ["dep:audio-blocks"]
 
 # All codecs including royalty-encumbered formats (MP3, AAC, etc.)
 all-codecs = ["symphonia/all"]
+
+# Enable Symphonia's SIMD optimizations
+simd = ["symphonia/opt-simd"]
 
 aac = ["symphonia/aac"]
 adpcm = ["symphonia/adpcm"]

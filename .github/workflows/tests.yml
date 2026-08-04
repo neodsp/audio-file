@@ -25,4 +25,30 @@ jobs:
         # optional feature cannot break the default build.
       - run: cargo test --locked --doc --workspace
       - run: cargo test --locked --all-features --doc --workspace
-      - run: cargo test --locked --no-default-features --features wav,pcm --all-targets --workspace
+
+  reduced-features:
+    name: 🧪 Reduced Features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile test targets
+        run: cargo test --locked --no-run --no-default-features --features ${{ matrix.features }} --all-targets --workspace
+      - name: Run WAV/PCM tests
+        if: matrix.features == 'wav,pcm'
+        run: cargo test --locked --no-default-features --features wav,pcm --all-targets --workspace
+      - name: Run Ogg/Vorbis tests
+        if: matrix.features == 'ogg,vorbis'
+        run: cargo test --locked --no-default-features --features ogg,vorbis --workspace test_vorbis_ogg
+      - name: Verify WAV/PCM feature isolation
+        if: matrix.features == 'wav,pcm'
+        shell: bash
+        run: |
+          cargo tree -e features --no-default-features --features wav,pcm -i symphonia | tee symphonia-features.txt
+          if grep -E 'symphonia feature "(default|opt-simd|aac|adpcm|aiff|alac|caf|flac|isomp4|mkv|mp1|mp2|mp3|ogg|vorbis)"' symphonia-features.txt; then
+            echo "Unexpected Symphonia feature enabled by wav,pcm"
+            exit 1
+          fi

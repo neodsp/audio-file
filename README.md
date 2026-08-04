@@ -56,8 +56,9 @@ audio_file::write_block("output_layout.wav", block, sample_rate, audio_file::Wri
 
 ## Supported Input Formats
 
-Default features enable all codecs (including royalty-encumbered formats) via `all-codecs`.
-To opt out, disable default features and enable only what you need.
+Default features enable all codecs (including royalty-encumbered formats) via `all-codecs`
+and Symphonia's SIMD optimizations via `simd`. To opt out, disable default features and
+enable only what you need.
 
 | Format | Feature Flag |
 |--------|--------------|
@@ -79,7 +80,8 @@ To opt out, disable default features and enable only what you need.
 
 Feature flags:
 
-- `all-codecs` enables all Symphonia codecs (this is the default).
+- `all-codecs` enables all Symphonia codecs (enabled by default).
+- `simd` enables Symphonia's SIMD optimizations (enabled by default).
 - `audio-blocks` enables `read_block` and `write_block`.
 - Individual codec flags (above) enable specific formats.
 
