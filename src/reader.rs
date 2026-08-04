@@ -225,6 +225,69 @@ fn prepare_track(
     Ok(Some((info, decoder)))
 }
 
+/// Audio specification of the decoded audio, as opposed to the one the
+/// container declares.
+#[derive(Clone, Copy)]
+struct DecodedSpec {
+    sample_rate: u32,
+    channels: usize,
+}
+
+/// Decode packets until the decoder reports the specification of its output.
+///
+/// Container metadata can contradict the bitstream headers, for example a
+/// Matroska `SamplingFrequency` element that disagrees with the FLAC stream
+/// info, and symphonia's demuxers report the container value. Only some
+/// decoders amend their codec parameters with what they read from the
+/// bitstream, so the specification of a decoded packet is the only reliable
+/// source. `None` means the file has no decodable audio packet at all, in which
+/// case the container declaration is all there is.
+fn probe_decoded_spec(
+    path: &Path,
+    dec_opts: &AudioDecoderOptions,
+) -> Result<Option<DecodedSpec>, ReadError> {
+    let mut format = open_format(path)?;
+    let (mut track, mut decoder) = select_track(&*format, dec_opts)?;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return Ok(None),
+            // A chained stream starts a new track list before the first packet
+            // of the previous one could be decoded.
+            Err(Error::ResetRequired) => {
+                (track, decoder) = select_track(&*format, dec_opts)?;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        if packet.track_id != track.id {
+            continue;
+        }
+
+        // A warm-up packet without any frames still carries the specification
+        // the decoder was configured with, so it does not have to be skipped.
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                return Ok(Some(DecodedSpec {
+                    sample_rate: decoded.spec().rate(),
+                    channels: decoded.spec().channels().count(),
+                }));
+            }
+            // Discardable packets are skipped here for the same reason as
+            // during the read itself, so that one malformed packet at the start
+            // of a file does not hide the specification of all the others.
+            Err(Error::DecodeError(_) | Error::IoError(_)) => continue,
+            Err(Error::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
     let src = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
@@ -246,7 +309,16 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     let mut format = open_format(path)?;
     let dec_opts: AudioDecoderOptions = Default::default();
     let (mut track, mut decoder) = select_track(&*format, &dec_opts)?;
-    let sample_rate = track.sample_rate;
+
+    // The decoded specification is authoritative when packets are available.
+    // Every frame position, the returned sample rate, and the resampling ratio
+    // are resolved against the audio that is really produced, rather than
+    // against a container declaration that may disagree with the bitstream. The
+    // declaration is retained only as a fallback for files without any decoded
+    // audio.
+    let probed = probe_decoded_spec(path, &dec_opts)?;
+    let sample_rate = probed.map_or(track.sample_rate, |spec| spec.sample_rate);
+    let fallback_channels = probed.map(|spec| spec.channels).or(track.channels);
 
     // Convert start/stop positions to frame numbers
     let start_frame = position_to_frame(config.start, sample_rate).unwrap_or(0);
@@ -260,12 +332,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             end: end_frame,
         });
     }
-
-    // The decoded specification is authoritative when packets are available.
-    // Retain the container declaration only as a fallback for files without any
-    // decoded audio, rather than rejecting a selection against a possibly stale
-    // metadata value before decoding starts.
-    let declared_channels = track.channels;
 
     // Seek for large offsets to avoid decoding data that is thrown away again.
     // Below one second the seek overhead is not worth it, and decoding from the
@@ -310,11 +376,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     let mut samples: Vec<F> = Vec::new();
     let mut layout: Option<Layout> = None;
 
-    // Sample rate reported by the first decoded packet. The decoded rate is
-    // taken from the bitstream, so it may disagree with the container, but it
-    // must stay the same for every packet that follows.
-    let mut decoded_rate: Option<u32> = None;
-
     // Reused per packet to hold the selected frames of the decoded audio.
     // `f64` is used because it can hold every sample format symphonia decodes
     // to without losing precision.
@@ -322,7 +383,7 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
 
     // Reserve up front when the container reports a frame count, so that long
     // reads don't repeatedly reallocate a growing buffer.
-    if let Some(ch_count) = declared_channels
+    if let Some(ch_count) = fallback_channels
         .and_then(|total| channel_range(config, total).ok().map(|(_, count)| count))
         && let Some(frames) = expected_frames(start_frame, end_frame, track.num_frames)
     {
@@ -397,20 +458,16 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Err(err) => return Err(err.into()),
         };
 
-        // The decoded specification is authoritative for the channel count and
-        // the sample rate, the container hint may disagree with them. Both have
-        // to stay stable, otherwise the frames of this packet do not belong to
-        // the same stream as everything that was decoded before.
+        // The decoded specification has to stay stable, otherwise the frames of
+        // this packet do not belong to the same stream as everything that was
+        // decoded before. A rate that differs from the probed one also
+        // invalidates every frame position that was resolved from it.
         let packet_rate = decoded.spec().rate();
-        match decoded_rate {
-            Some(known) if known != packet_rate => {
-                return Err(ReadError::SampleRateChanged {
-                    expected: known,
-                    found: packet_rate,
-                });
-            }
-            Some(_) => (),
-            None => decoded_rate = Some(packet_rate),
+        if packet_rate != sample_rate {
+            return Err(ReadError::SampleRateChanged {
+                expected: sample_rate,
+                found: packet_rate,
+            });
         }
 
         let total_channels = decoded.spec().channels().count();
@@ -490,11 +547,12 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         }
     }
 
-    // Fall back to and validate against the declared channel count only if no
-    // decoded specification was available (for example, an empty WAV file).
+    // Fall back to and validate against the channel count of the probe, or of
+    // the container if the file has no decodable audio at all (for example, an
+    // empty WAV file).
     let num_channels = match layout {
         Some(layout) => layout.count,
-        None => declared_channels
+        None => fallback_channels
             .map(|total| channel_range(config, total))
             .transpose()?
             .map(|(_, count)| count)
@@ -598,12 +656,24 @@ pub fn read_block<F: num::Float + 'static + rubato::Sample>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use audio_blocks::{AudioBlock, InterleavedView};
-
     use super::*;
 
+    // Only the tests reading the WAV fixtures use these
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    use audio_blocks::{AudioBlock, InterleavedView};
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    use std::time::Duration;
+
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     fn to_block<F: num::Float + 'static>(audio: &Audio<F>) -> InterleavedView<'_, F> {
         InterleavedView::from_slice(&audio.samples_interleaved, audio.num_channels)
     }
@@ -613,6 +683,10 @@ mod tests {
     /// - 4 channels with frequencies: [440, 554.37, 659.25, 880] Hz
     /// - Sample rate: 48000 Hz
     /// - Duration: 1 second (48000 samples)
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_sine_wave_data_integrity() {
         const SAMPLE_RATE: f64 = 48000.0;
@@ -666,6 +740,10 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_samples_selection() {
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
@@ -690,6 +768,10 @@ mod tests {
         assert_eq!(block1.raw_data()[1100..1200], block2.raw_data()[..]);
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_time_selection() {
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
@@ -715,6 +797,10 @@ mod tests {
         assert_eq!(block1.raw_data()[24000..28800], block2.raw_data()[..]);
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_channel_selection() {
         let audio1 = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
@@ -745,6 +831,10 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_fail_selection() {
         match read::<f32>(
@@ -847,6 +937,10 @@ mod tests {
         assert!(!error.to_string().is_empty());
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_resample_preserves_frequency() {
         const FREQUENCIES: [f64; 4] = [440.0, 554.37, 659.25, 880.0];
@@ -900,6 +994,10 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_channel_selection_with_resampling() {
         // This test verifies that channel selection combined with resampling works correctly
@@ -995,6 +1093,8 @@ mod tests {
     ))]
     fn assert_ranges_match_full_decode(path: &str, ranges: &[std::ops::Range<usize>]) {
         let full = read::<f32>(path, ReadConfig::default()).unwrap();
+        // The ranges are frame ranges, the buffers hold interleaved samples
+        let channels = usize::from(full.num_channels);
 
         for range in ranges {
             let selected = read::<f32>(
@@ -1007,9 +1107,13 @@ mod tests {
             )
             .unwrap();
 
-            let expected = &full.samples_interleaved[range.clone()];
+            let expected = &full.samples_interleaved[range.start * channels..range.end * channels];
+            assert_eq!(
+                selected.num_channels, full.num_channels,
+                "{path}: range {range:?} changed the channel count"
+            );
             assert!(
-                selected.samples_interleaved.len() <= range.len(),
+                selected.samples_interleaved.len() <= range.len() * channels,
                 "{path}: range {range:?} returned too many frames"
             );
             assert_eq!(
@@ -1098,6 +1202,67 @@ mod tests {
         );
     }
 
+    /// The Matroska track metadata declares 22.05 kHz while the FLAC stream info
+    /// declares 44.1 kHz. Symphonia's Matroska demuxer reports the container
+    /// value, so trusting it labels the returned audio with the wrong rate and
+    /// resolves time positions and the resampling ratio against it.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    #[test]
+    fn test_sample_rate_uses_decoded_stream_info() {
+        const PATH: &str = "test_data/test_declared_rate_mismatch.mka";
+
+        // Assert the fixture still contains the intended metadata disagreement.
+        let format = open_format(Path::new(PATH)).unwrap();
+        let declared_rate = format
+            .default_track(TrackType::Audio)
+            .and_then(|track| track.codec_params.as_ref())
+            .and_then(CodecParameters::audio)
+            .and_then(|params| params.sample_rate);
+        assert_eq!(declared_rate, Some(22_050));
+
+        let full = read::<f32>(PATH, ReadConfig::default()).unwrap();
+        assert_eq!(full.sample_rate, 44_100);
+        assert_eq!(full.num_channels, 1);
+        // 20 ms of 44.1 kHz audio
+        assert_eq!(full.samples_interleaved.len(), 882);
+
+        // A time position must be resolved against the decoded rate, otherwise
+        // 10 ms yields the 220 frames that the declared rate implies.
+        let selected = read::<f32>(
+            PATH,
+            ReadConfig {
+                stop: Position::Time(std::time::Duration::from_millis(10)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.sample_rate, 44_100);
+        assert_eq!(selected.samples_interleaved.len(), 441);
+        assert_eq!(
+            selected.samples_interleaved,
+            full.samples_interleaved[..441]
+        );
+
+        // Resampling must start from the decoded rate, so asking for the rate
+        // the file really has must not change its length.
+        let resampled = read::<f32>(
+            PATH,
+            ReadConfig {
+                sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resampled.sample_rate, 44_100);
+        assert_eq!(
+            resampled.samples_interleaved.len(),
+            full.samples_interleaved.len()
+        );
+    }
+
     /// Chained Ogg streams may replace the decoder and decoded layout. A real
     /// channel-count change cannot be represented in one interleaved output.
     #[cfg(all(
@@ -1166,6 +1331,10 @@ mod tests {
     }
 
     /// A stop position must not bypass the resampling step.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_stop_with_resampling() {
         let sr_out: u32 = 24000;
@@ -1187,6 +1356,10 @@ mod tests {
     }
 
     /// The seek path is only taken for start offsets of more than one second.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_start_beyond_seek_threshold() {
         let path = "tmp_read_seek.wav";
@@ -1238,6 +1411,10 @@ mod tests {
 
     /// A file without audio frames must report the declared channel layout and
     /// still validate the channel selection.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_read_file_without_frames() {
         let path = "tmp_read_empty.wav";

@@ -41,6 +41,12 @@
 - Support for chained streams (e.g. concatenated OGG files): the decoder is
   rebuilt when the track list changes, and the timeline continues across
   streams.
+- The sample rate is taken from the decoded audio, which is authoritative,
+  instead of from a container declaration that may contradict the bitstream
+  headers. A Matroska file whose `SamplingFrequency` element disagrees with the
+  FLAC stream info is no longer reported with the wrong sample rate, and
+  time-based positions as well as the resampling ratio are resolved against the
+  rate the file really has.
 - The sample rate is checked against every decoded packet, and against the track
   list of a chained stream. A file that switches its sample rate mid-stream now
   fails with `SampleRateChanged` instead of returning audio that plays at the

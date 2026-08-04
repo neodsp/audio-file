@@ -30,6 +30,24 @@ assert data.count(old) == 1, "unexpected Matroska audio element layout"
 path.write_bytes(data.replace(old, new, 1))
 PY
 
+# Deliberately make Matroska's SamplingFrequency element disagree with the
+# authoritative FLAC stream info, the same way as the Channels element above.
+# The element is `b5 88` followed by a big-endian double; halving the declared
+# rate leaves the encoded 44.1 kHz FLAC stream untouched.
+ffmpeg -y -i test_data/test_1ch.wav -t 0.02 -ar 44100 -map_metadata -1 \
+    -c:a flac test_data/test_declared_rate_mismatch.mka
+python3 - <<'PY'
+import struct
+from pathlib import Path
+
+path = Path("test_data/test_declared_rate_mismatch.mka")
+data = path.read_bytes()
+old = b"\xb5\x88" + struct.pack(">d", 44100.0)
+new = b"\xb5\x88" + struct.pack(">d", 22050.0)
+assert data.count(old) == 1, "unexpected Matroska sampling frequency element"
+path.write_bytes(data.replace(old, new, 1))
+PY
+
 # Concatenated Ogg bitstreams are a chained stream. Each link is independently
 # valid, but their decoded channel counts intentionally change from mono to stereo.
 ffmpeg -y -i test_data/test_1ch.wav -t 0.02 -map_metadata -1 \

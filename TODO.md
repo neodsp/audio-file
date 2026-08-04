@@ -6,8 +6,8 @@ Issues found while reviewing `next` against `main`. Complete the release-blockin
 
 ### [x] Fix frame-range selection for compressed/container formats
 
-**Priority:** High  
-**Relevant code:** `src/reader.rs:326-332`, `src/reader.rs:387-431`
+- **Priority:** High
+- **Relevant code:** `src/reader.rs:326-332`, `src/reader.rs:387-431`
 
 Decoded buffers are currently positioned directly from each packet's PTS. Packet timestamps may be coarser than one audio frame, and a decoder's output does not always correspond directly to the current packet's nominal PTS. This can produce overlapping, missing, or prematurely terminated ranges.
 
@@ -28,8 +28,8 @@ Acceptance criteria:
 
 ### [x] Make default-track fallback reject null or unusable codecs
 
-**Priority:** Medium  
-**Relevant code:** `src/reader.rs:174-185`, `src/reader.rs:259-261`, `release-notes.md:10-13`
+- **Priority:** Medium
+- **Relevant code:** `src/reader.rs:174-185`, `src/reader.rs:259-261`, `release-notes.md:10-13`
 
 `default_track(TrackType::Audio)` can return a default-marked track whose codec is named by the demuxer but has no registered decoder, such as AC-3, DTS or TrueHD in Matroska, or a codec excluded by the enabled features. Checking only `codec_params.is_some()` accepts that track, so no other audio track is ever tried and decoder creation fails even if a usable one exists.
 
@@ -44,8 +44,8 @@ Acceptance criteria:
 
 ### [x] Validate channel selection against the authoritative decoded layout
 
-**Priority:** Medium  
-**Relevant code:** `src/reader.rs:227-233`, `src/reader.rs:352-384`
+- **Priority:** Medium
+- **Relevant code:** `src/reader.rs:227-233`, `src/reader.rs:352-384`
 
 Channel selection is rejected up front using the container-declared channel count, even though the decoded specification is treated as authoritative later. For example, metadata declaring mono can reject `start_channel: Some(1)` even if the decoder produces stereo.
 
@@ -56,12 +56,28 @@ Acceptance criteria:
 - Detect and report actual mid-stream channel-count changes.
 - Add tests for container metadata that disagrees with the decoded channel layout and for empty files.
 
+### [x] Take the sample rate from the decoded audio as well
+
+- **Priority:** High
+- **Relevant code:** `src/reader.rs:228-291`, `src/reader.rs:309-320`
+
+The channel count was made decoder-authoritative, but the sample rate was still taken from the container. Symphonia's Matroska demuxer reports the container's `SamplingFrequency` element verbatim (`symphonia-format-mkv/src/codecs.rs:69`), and only some decoders amend their codec parameters from the bitstream headers, so a declaration that contradicts the stream is passed through. Reading a 44.1 kHz FLAC-in-Matroska file whose container declares 22.05 kHz returned all 132300 frames labelled as 22050 Hz, resolved `Position::Time` against the wrong rate (a one-second stop yielded half a second of audio) and resampled from the wrong input rate.
+
+The reader now decodes the first packet up front and uses the specification of the decoded audio for the sample rate and as the channel-count fallback. The container declaration is only used for files without a single decodable packet.
+
+Acceptance criteria:
+
+- The returned sample rate is the rate of the decoded audio.
+- Time positions and the resampling ratio are resolved against that rate.
+- A packet that decodes at a different rate than the probed one is reported as `SampleRateChanged`.
+- Add a regression fixture/test whose container rate contradicts the codec's own header.
+
 ## Release automation
 
 ### [x] Align release workflow tags with the repository convention
 
-**Priority:** Medium  
-**Relevant code:** `.github/workflows/release.yml:3-6`
+- **Priority:** Medium
+- **Relevant code:** `.github/workflows/release.yml:3-6`
 
 Release tags remain unprefixed (`0.1.0`, `0.5.0`, etc.). The workflow now follows this established convention and compares the complete tag directly with the crate version.
 
@@ -74,8 +90,8 @@ Acceptance criteria:
 
 ### [x] Make reduced-feature CI actually disable Symphonia defaults
 
-**Priority:** Medium  
-**Relevant code:** `Cargo.toml:19`, `.github/workflows/tests.yml:28`
+- **Priority:** Medium
+- **Relevant code:** `Cargo.toml:19`, `.github/workflows/tests.yml:28`
 
 `cargo test --no-default-features --features wav,pcm` disables this crate's defaults, but `symphonia = "0.6"` still enables Symphonia's default codec, container, metadata, and SIMD features. The test therefore cannot detect broken `wav` or `pcm` feature mappings.
 
@@ -87,12 +103,27 @@ Acceptance criteria:
 - Test required feature combinations such as `wav,pcm`, `ogg,vorbis`, and `isomp4,aac`.
 - Confirm `cargo tree -e features --no-default-features --features wav,pcm` does not include unrelated codecs or containers.
 
+### [x] Close the gaps in the quality and test workflows
+
+- **Priority:** Medium
+- **Relevant code:** `.github/workflows/quality.yml`, `.github/workflows/tests.yml:29-45`, `taplo.toml`
+
+The reduced-feature job ran a single hand-picked test by name filter, and `cargo test` exits successfully when a filter matches nothing, so renaming that test would have turned the job into a silent no-op. Clippy, the doc build and the MSRV check ran without `--all-features`, so `read_block` and `write_block` were never linted or documented under `-D warnings`, and the MSRV check ignored the tests and the lock file.
+
+Acceptance criteria:
+
+- Every test that needs a fixture format is gated on the features of that format, so the whole suite runs for each feature combination instead of a filtered subset.
+- Clippy runs over all features and over a reduced feature set, both with `--all-targets`.
+- The doc build and the MSRV check cover all features; the MSRV check also covers the tests and uses `--locked`.
+- `taplo fmt --check` ignores the generated `Cargo.toml` copies under `target/`.
+- Re-running the release workflow for an existing tag updates the release instead of failing.
+
 ## Documentation
 
-### [ ] Correct the selective-decoding claim
+### [x] Correct the selective-decoding claim
 
-**Priority:** Low  
-**Relevant code:** `src/reader.rs:109-116`, `README.md:97`
+- **Priority:** Low
+- **Relevant code:** `src/reader.rs:109-116`, `README.md:97`
 
 The documentation says the crate only decodes and stores the selected range. In practice, small offsets decode from the beginning, and large offsets seek early and decode warm-up packets. Only selected frames are stored.
 
@@ -106,13 +137,35 @@ Acceptance criteria:
 
 After completing the tasks above, run:
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy --locked --all-features --all-targets --workspace -- -D warnings`
-- [ ] `cargo test --locked --all-features --all-targets --workspace`
-- [ ] `cargo test --locked --doc --workspace`
-- [ ] `cargo test --locked --all-features --doc --workspace`
-- [x] Reduced-feature tests with Symphonia defaults genuinely disabled
-- [ ] Compressed-format range regression tests
-- [ ] `cargo doc --locked --all-features --no-deps`
-- [ ] `cargo package --locked --allow-dirty`
-- [ ] `git diff --check main...HEAD`
+- [x] `cargo fmt --check`
+- [x] `taplo fmt --check`
+- [x] `cargo clippy --locked --all-features --all-targets --workspace -- -D warnings`
+- [x] `cargo clippy --locked --no-default-features --features wav,pcm --all-targets --workspace -- -D warnings`
+- [x] `cargo test --locked --all-features --all-targets --workspace`
+- [x] `cargo test --locked --doc --workspace`
+- [x] `cargo test --locked --all-features --doc --workspace`
+- [x] Reduced-feature tests with Symphonia defaults genuinely disabled, for `wav,pcm`, `ogg,vorbis`, `isomp4,aac` and `mkv,flac`
+- [x] Compressed-format range regression tests
+- [x] `cargo +1.88.0 check --locked --all-features --all-targets --workspace` (MSRV)
+- [x] `cargo doc --locked --all-features --no-deps`
+- [x] `cargo rdme --check`
+- [x] `cargo package --locked --allow-dirty`
+- [x] `git diff --check main...HEAD`
+
+## Follow-ups, not release blocking
+
+- A packet that fails to decode is skipped and the position is recovered from the
+  next timestamp, but the lost frames are not filled, so everything after the gap
+  moves earlier in the returned buffer. Zero-filling the known gap would keep the
+  read frame-accurate. The recovery path has no test.
+- The `short_name != "matroska"` seek guard in `decode` is never exercised: all
+  Matroska fixtures are 44.1 kHz with a millisecond time base, so
+  `time_base_has_exact_frames` already rejects the seek. A 48 kHz FLAC-in-Matroska
+  fixture with ranges past the seek threshold would lock the guard in.
+- The encoder delay and padding handling that `release-notes.md` describes has no
+  fixture. It relies on symphonia signalling delay frames as a negative PTS plus
+  `trim_start`, which the MP3 and Vorbis decoders apply themselves.
+- `SampleRateChanged`, `TooManyChannels` and `NoChannels` have no test, and
+  `read_block` is only covered by a doc test.
+- `cargo package` ships this file and `utils/`. Consider removing `TODO.md` before
+  tagging, or adding a `package.exclude` for the internal files.

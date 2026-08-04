@@ -36,7 +36,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: RUSTFLAGS="-D warnings" cargo clippy --all-targets
+      - run: cargo clippy --locked --all-features --all-targets --workspace -- -D warnings
+        # The optional codec features cfg out parts of the tests, so lint a
+        # reduced set as well instead of only the complete one.
+      - run: cargo clippy --locked --no-default-features --features wav,pcm --all-targets --workspace -- -D warnings
 
   doc:
     name: 📚 Documentation
@@ -44,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --document-private-items
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --document-private-items
 
   semver:
     name: 🏷️ Semver Checks
@@ -62,7 +65,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
-      - run: cargo check --all-features
+        # --locked so that a dependency update cannot silently change what is
+        # checked, --all-targets so that the tests have to build as well.
+      - run: cargo check --locked --all-features --all-targets --workspace
 
   readme:
     name: 📖 README Check

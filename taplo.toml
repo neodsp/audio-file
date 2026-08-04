@@ -1,3 +1,7 @@
+# Generated copies of Cargo.toml, for example from `cargo package` or
+# `cargo semver-checks`, are not formatted by this repository.
+exclude = ["target/**"]
+
 [formatting]
 column_width = 100
 reorder_arrays = true

@@ -31,18 +31,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac"]
+        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac", "mkv,flac"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Compile test targets
-        run: cargo test --locked --no-run --no-default-features --features ${{ matrix.features }} --all-targets --workspace
-      - name: Run WAV/PCM tests
-        if: matrix.features == 'wav,pcm'
-        run: cargo test --locked --no-default-features --features wav,pcm --all-targets --workspace
-      - name: Run Ogg/Vorbis tests
-        if: matrix.features == 'ogg,vorbis'
-        run: cargo test --locked --no-default-features --features ogg,vorbis --workspace test_vorbis_ogg
+        # Every test that needs a fixture format is gated on the features of that
+        # format, so the whole suite runs for each combination. A name filter
+        # would pass silently once the test it names is renamed, because cargo
+        # test succeeds when a filter matches nothing.
+        #
+        # --all-targets skips the doc tests, which all read the WAV fixtures.
+      - run: cargo test --locked --no-default-features --features ${{ matrix.features }} --all-targets --workspace
       - name: Verify WAV/PCM feature isolation
         if: matrix.features == 'wav,pcm'
         shell: bash

@@ -58,10 +58,13 @@ pub fn resample<F: Float + rubato::Sample>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_resample_preserves_frequency() {
+        use super::*;
         use crate::reader::{ReadConfig, read};
         use audio_blocks::{AudioBlock, InterleavedView};
 

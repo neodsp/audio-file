@@ -133,6 +133,10 @@ pub fn write_block<P: AsRef<Path>, F: Float + 'static>(
 #[cfg(test)]
 mod tests {
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_round_trip_i8() {
         use super::*;
@@ -166,6 +170,10 @@ mod tests {
         std::fs::remove_file("tmp0.wav").expect("Failed to remove temporary test file");
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_round_trip_i16() {
         use super::*;
@@ -196,6 +204,10 @@ mod tests {
         std::fs::remove_file("tmp1.wav").expect("Failed to remove temporary test file");
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_round_trip_i32() {
         use super::*;
@@ -255,6 +267,10 @@ mod tests {
 
     /// Full scale samples must not wrap around or drop out, which happens when
     /// the integer range is not exactly representable in the sample type.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_full_scale_round_trip() {
         use super::*;
@@ -282,6 +298,10 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
     #[test]
     fn test_round_trip_f32() {
         use super::*;
