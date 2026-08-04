@@ -194,7 +194,7 @@ fn select_track(format: &dyn FormatReader) -> Result<TrackInfo, ReadError> {
     })
 }
 
-fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, ReadError> {
+fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
     let src = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -203,11 +203,16 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         hint.with_extension(ext);
     }
 
-    let meta_opts: MetadataOptions = Default::default();
-    let fmt_opts: FormatOptions = Default::default();
+    Ok(symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    )?)
+}
 
-    let mut format = symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts)?;
-
+fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, ReadError> {
+    let mut format = open_format(path)?;
     let mut track = select_track(&*format)?;
     let sample_rate = track.sample_rate;
 
@@ -235,25 +240,41 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     // Seek for large offsets to avoid decoding data that is thrown away again.
     // Below one second the seek overhead is not worth it, and decoding from the
     // beginning while discarding samples is simpler.
+    let mut seeked = false;
     if start_frame > sample_rate as usize
         && let Some(tb) = track.time_base
+        && time_base_has_exact_frames(tb, sample_rate)
+        // Symphonia's Matroska accurate seek may land several seconds after its
+        // target. Disable it explicitly until the demuxer can guarantee a safe
+        // landing; decoding from the beginning is slower but frame-correct.
+        && format.format_info().short_name != "matroska"
     {
-        // An accurate seek always lands at or before the requested position, but
-        // aim one second early anyway to give codecs with inter-frame
-        // dependencies time to warm up. The frames in between are discarded
-        // while decoding.
+        // Aim one second early to give codecs with inter-frame dependencies time
+        // to warm up. Some format readers may still land after the requested
+        // start despite `SeekMode::Accurate`; such a seek cannot produce the full
+        // requested range and is discarded below.
         let target = start_frame.saturating_sub(sample_rate as usize) as u64;
         let ts = i64::try_from(frames_to_ts(target, tb, sample_rate)).unwrap_or(i64::MAX);
 
-        // Try to seek, but don't fail if seeking doesn't work. The stream
-        // position is recovered from the packet timestamps either way.
-        let _ = format.seek(
+        let seek_result = format.seek(
             SeekMode::Accurate,
             SeekTo::Timestamp {
                 ts: Timestamp::new(ts),
                 track_id: track.id,
             },
         );
+
+        if let Ok(result) = seek_result
+            && seek_landing_is_safe(result.actual_ts.get(), start_frame as u64, tb, sample_rate)
+        {
+            seeked = true;
+        } else {
+            // A failed seek is not guaranteed to leave every format reader at its
+            // original position. Reopening is also the only reliable way to undo
+            // a successful seek that overshot the requested start.
+            format = open_format(path)?;
+            track = select_track(&*format)?;
+        }
     }
 
     let dec_opts: AudioDecoderOptions = Default::default();
@@ -281,15 +302,18 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         samples.reserve(frames.saturating_mul(ch_count).min(MAX_PREALLOC_SAMPLES));
     }
 
-    // Absolute frame index of the next frame to be decoded. Streams with a time
-    // base take their position from the packet timestamps instead, and only use
-    // this to continue the timeline across a chained stream.
-    let mut position: Option<u64> = None;
-
-    // Offset applied to packet timestamps. Stays zero unless a chained stream
-    // restarts its timestamps, in which case it continues where the previous
-    // stream ended.
+    // Absolute frame index of the next decoded frame. Decoding from the beginning
+    // has an exact zero anchor. After a successful seek (or a discontinuity), one
+    // packet timestamp establishes a new anchor; decoded frame counts advance it
+    // from then on. Re-anchoring every packet would turn timestamp quantization
+    // into overlaps or gaps.
+    let mut position = if seeked { None } else { Some(0) };
+    // Offset for re-anchoring within a chained stream, whose packet timestamps
+    // restart at zero even though its decoded frames continue the output.
     let mut stream_base = 0u64;
+    // Never copy the same absolute frame twice if timestamp-based recovery after
+    // a decode error lands before data that was already returned.
+    let mut copied_until = start_frame as u64;
 
     loop {
         let packet = match format.next_packet() {
@@ -311,9 +335,10 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                 decoder =
                     symphonia::default::get_codecs().make_audio_decoder(&next.params, &dec_opts)?;
                 track = next;
-                // The new stream restarts its timestamps at zero, so continue
-                // the timeline where the previous stream ended.
-                stream_base = position.unwrap_or(0);
+                // Keep `position` for normal decoding, and retain the boundary as
+                // the base if a later error requires re-anchoring from this new
+                // stream's zero-based timestamps.
+                stream_base = position.unwrap_or(stream_base);
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -323,14 +348,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             continue;
         }
 
-        // Frames before the presentation timestamp are encoder delay that the
-        // decoder discards, so the trimmed buffer starts at `pts + trim_start`.
-        let packet_ts = packet
-            .pts
-            .get()
-            .saturating_add_unsigned(packet.trim_start.get())
-            .max(0) as u64;
-
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
             // A malformed packet is discardable and decoding may continue with
@@ -338,12 +355,17 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // timestamp. Without a time base the discarded frames would shift
             // everything that follows, so the error is propagated instead.
             Err(Error::DecodeError(_) | Error::IoError(_)) if track.time_base.is_some() => {
+                // The number of frames lost with this packet is unknown. Let the
+                // next non-empty packet establish a new position instead of
+                // shifting all later decoded frames by the missing amount.
+                position = None;
                 continue;
             }
             // The audio specification of the decoded audio may change after a
             // reset, which is picked up from the next packet.
             Err(Error::ResetRequired) => {
                 decoder.reset();
+                position = None;
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -386,17 +408,26 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
 
         let packet_frames = decoded.frames();
 
-        // The timestamp states where these frames belong, which is more robust
-        // than counting decoded frames: a decoder may return fewer frames than
-        // the packet covers, for example while warming up after a seek.
-        let packet_start = match track.time_base {
-            Some(tb) => stream_base + ts_to_frames(packet_ts, tb, sample_rate),
-            None => position.unwrap_or(0),
+        // Decoder output is continuous after it has been anchored. At a
+        // discontinuity, empty warm-up buffers cannot identify the position of
+        // later output, so wait for the first packet that actually emits frames.
+        let packet_start = match position {
+            Some(position) => position,
+            None if packet_frames == 0 => continue,
+            None => match track.time_base {
+                Some(tb) => stream_base.saturating_add(timestamp_to_frame(
+                    packet.pts.get(),
+                    packet.trim_start.get(),
+                    tb,
+                    sample_rate,
+                )),
+                None => stream_base,
+            },
         };
-        let packet_end = packet_start + packet_frames as u64;
+        let packet_end = packet_start.saturating_add(packet_frames as u64);
 
         // Intersect the packet with the requested frame range
-        let copy_start = packet_start.max(start_frame as u64);
+        let copy_start = packet_start.max(start_frame as u64).max(copied_until);
         let copy_end = match end_frame {
             Some(end) => packet_end.min(end as u64),
             None => packet_end,
@@ -421,6 +452,7 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                     extend_samples(&mut samples, selected);
                 }
             }
+            copied_until = copy_end;
         }
 
         position = Some(packet_end);
@@ -498,10 +530,23 @@ fn expected_frames(start: usize, end: Option<usize>, n_frames: Option<u64>) -> O
     Some(end.saturating_sub(start))
 }
 
-/// Frame index that the timestamp `ts` refers to.
-fn ts_to_frames(ts: u64, tb: TimeBase, sample_rate: u32) -> u64 {
-    let dividend = ts as u128 * u128::from(tb.numer.get()) * u128::from(sample_rate);
-    (dividend / u128::from(tb.denom.get())) as u64
+/// Frame index that a signed timestamp and subsequent frame trim refer to.
+fn timestamp_to_frame(ts: i64, trim_start: u64, tb: TimeBase, sample_rate: u32) -> u64 {
+    let frames = i128::from(ts) * i128::from(tb.numer.get()) * i128::from(sample_rate)
+        / i128::from(tb.denom.get())
+        + i128::from(trim_start);
+    u64::try_from(frames).unwrap_or(if frames < 0 { 0 } else { u64::MAX })
+}
+
+/// Whether each timestamp tick maps to an exact audio-frame boundary.
+fn time_base_has_exact_frames(tb: TimeBase, sample_rate: u32) -> bool {
+    let frames_per_tick_numer = u128::from(tb.numer.get()) * u128::from(sample_rate);
+    frames_per_tick_numer.is_multiple_of(u128::from(tb.denom.get()))
+}
+
+/// Whether a seek landed early enough to decode the requested start frame.
+fn seek_landing_is_safe(actual_ts: i64, start_frame: u64, tb: TimeBase, sample_rate: u32) -> bool {
+    timestamp_to_frame(actual_ts, 0, tb, sample_rate) <= start_frame
 }
 
 /// Timestamp that refers to the frame at index `frame`.
@@ -885,6 +930,105 @@ mod tests {
                 max_error
             );
         }
+    }
+
+    #[test]
+    fn test_exact_frame_time_bases() {
+        assert!(time_base_has_exact_frames(
+            TimeBase::try_new(1, 1_000).unwrap(),
+            48_000
+        ));
+        assert!(time_base_has_exact_frames(
+            TimeBase::try_new(1, 48_000).unwrap(),
+            48_000
+        ));
+        assert!(!time_base_has_exact_frames(
+            TimeBase::try_new(1, 1_000).unwrap(),
+            44_100
+        ));
+        assert!(!time_base_has_exact_frames(
+            TimeBase::try_new(1, 96_000).unwrap(),
+            48_000
+        ));
+    }
+
+    #[test]
+    fn test_seek_landing_must_not_overshoot_start() {
+        let tb = TimeBase::try_new(1, 1_000).unwrap();
+        assert!(seek_landing_is_safe(1_250, 60_000, tb, 48_000));
+        assert!(!seek_landing_is_safe(1_251, 60_000, tb, 48_000));
+    }
+
+    #[cfg(any(
+        feature = "all-codecs",
+        all(feature = "mkv", feature = "flac"),
+        all(feature = "vorbis", any(feature = "mkv", feature = "ogg"))
+    ))]
+    fn assert_ranges_match_full_decode(path: &str, ranges: &[std::ops::Range<usize>]) {
+        let full = read::<f32>(path, ReadConfig::default()).unwrap();
+
+        for range in ranges {
+            let selected = read::<f32>(
+                path,
+                ReadConfig {
+                    start: Position::Frame(range.start),
+                    stop: Position::Frame(range.end),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let expected = &full.samples_interleaved[range.clone()];
+            assert!(
+                selected.samples_interleaved.len() <= range.len(),
+                "{path}: range {range:?} returned too many frames"
+            );
+            assert_eq!(
+                selected.samples_interleaved, expected,
+                "{path}: range {range:?} did not match the full decode"
+            );
+        }
+    }
+
+    /// Matroska timestamps are millisecond-based and therefore cannot position
+    /// individual 44.1 kHz decoded buffers without rounding errors.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    #[test]
+    fn test_flac_matroska_frame_ranges() {
+        assert_ranges_match_full_decode(
+            "test_data/test_flac.mka",
+            &[0..100, 4521..4621, 60_000..60_100],
+        );
+    }
+
+    /// Vorbis emits empty warm-up buffers before its first playable frames.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "vorbis")
+    ))]
+    #[test]
+    fn test_vorbis_matroska_frame_ranges() {
+        assert_ranges_match_full_decode(
+            "test_data/test_vorbis.mka",
+            &[0..100, 4521..4621, 60_000..60_100],
+        );
+    }
+
+    /// A seeked Vorbis decoder emits an empty warm-up buffer whose packet does
+    /// not own the first frames emitted by the following packet.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "ogg"),
+        any(feature = "all-codecs", feature = "vorbis")
+    ))]
+    #[test]
+    fn test_vorbis_ogg_seeked_frame_ranges() {
+        assert_ranges_match_full_decode(
+            "test_data/test_vorbis.ogg",
+            &[60_000..60_100, 100_000..100_100, 140_000..140_100],
+        );
     }
 
     /// A stop position must not bypass the resampling step.

@@ -94,7 +94,8 @@ When reading a file you can specify the following things:
 - Start channel and number of channels
 - Optional resampling
 
-The crate only decodes and stores the parts that you selected.
+The crate only stores the frames you selected. It seeks when the container can provide a safe,
+frame-accurate starting point; otherwise it may decode and discard earlier frames for correctness.
 
 The start position is inclusive and the stop position is exclusive, so reading from frame 300
 to frame 400 yields 100 frames. Frame 0 is the first playable frame: encoder delay and padding,
