@@ -13,3 +13,12 @@ ffmpeg -y -stream_loop 2 -i test_data/test_1ch.wav -ar 44100 -map_metadata -1 \
     -c:a libvorbis -q:a 5 test_data/test_vorbis.mka
 ffmpeg -y -stream_loop 2 -i test_data/test_1ch.wav -ar 48000 -map_metadata -1 \
     -c:a libvorbis -q:a 5 test_data/test_vorbis.ogg
+
+# Two audio tracks, the default one in a codec symphonia's Matroska demuxer
+# names but has no decoder for. Track selection has to skip it and fall back to
+# the decodable PCM track. AC-3 is used because it survives a container
+# round-trip with full codec parameters, so the track only becomes unusable at
+# decoder construction time.
+ffmpeg -y -i test_data/test_1ch.wav -t 0.02 -map 0:a:0 -map 0:a:0 -map_metadata -1 \
+    -c:a:0 ac3 -c:a:1 pcm_s16le -disposition:a:0 default -disposition:a:1 0 \
+    test_data/test_unusable_default.mka

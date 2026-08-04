@@ -4,10 +4,10 @@ use std::path::Path;
 use num::Float;
 use symphonia::core::audio::Channels;
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{TimeBase, Timestamp};
@@ -160,38 +160,69 @@ struct Layout {
 /// format reader so that the reader can be borrowed mutably again.
 struct TrackInfo {
     id: u32,
-    params: AudioCodecParameters,
     sample_rate: u32,
     channels: Option<usize>,
     time_base: Option<TimeBase>,
     num_frames: Option<u64>,
 }
 
-/// Pick the audio track to read.
+type SelectedTrack = (TrackInfo, Box<dyn AudioDecoder>);
+
+/// Pick the audio track to read and construct its decoder.
 ///
-/// Prefers the track the container marks as default, and falls back to the first
-/// audio track with a codec that can be decoded.
-fn select_track(format: &dyn FormatReader) -> Result<TrackInfo, ReadError> {
-    let track = format
-        .default_track(TrackType::Audio)
-        .filter(|track| track.codec_params.is_some())
-        .or_else(|| format.first_track_known_codec(TrackType::Audio))
-        .ok_or(ReadError::NoTrack)?;
+/// Prefers the track the container marks as default, and falls back through the
+/// remaining audio tracks until a decoder can be constructed.
+fn select_track(
+    format: &dyn FormatReader,
+    dec_opts: &AudioDecoderOptions,
+) -> Result<SelectedTrack, ReadError> {
+    let default = format.default_track(TrackType::Audio);
+    let default_id = default.map(|track| track.id);
+    let candidates = default.into_iter().chain(
+        format
+            .tracks()
+            .iter()
+            .filter(|track| Some(track.id) != default_id),
+    );
+    let mut first_error = None;
 
-    let params = track
-        .codec_params
-        .as_ref()
-        .and_then(CodecParameters::audio)
-        .ok_or(ReadError::NoTrack)?;
+    for track in candidates {
+        match prepare_track(track, dec_opts) {
+            Ok(Some(selected)) => return Ok(selected),
+            Ok(None) => (),
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+    }
 
-    Ok(TrackInfo {
+    Err(first_error.unwrap_or(ReadError::NoTrack))
+}
+
+/// Extract the metadata needed by the reader and verify that the track really
+/// has a registered decoder. `None` means this is not a usable audio track.
+fn prepare_track(
+    track: &Track,
+    dec_opts: &AudioDecoderOptions,
+) -> Result<Option<SelectedTrack>, ReadError> {
+    let Some(params) = track.codec_params.as_ref().and_then(CodecParameters::audio) else {
+        return Ok(None);
+    };
+
+    if params.codec == CODEC_ID_NULL_AUDIO {
+        return Ok(None);
+    }
+
+    let decoder = symphonia::default::get_codecs().make_audio_decoder(params, dec_opts)?;
+    let info = TrackInfo {
         id: track.id,
         sample_rate: params.sample_rate.ok_or(ReadError::NoSampleRate)?,
         channels: params.channels.as_ref().map(Channels::count),
-        params: params.clone(),
         time_base: track.time_base,
         num_frames: track.num_frames,
-    })
+    };
+
+    Ok(Some((info, decoder)))
 }
 
 fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
@@ -213,7 +244,8 @@ fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
 
 fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, ReadError> {
     let mut format = open_format(path)?;
-    let mut track = select_track(&*format)?;
+    let dec_opts: AudioDecoderOptions = Default::default();
+    let (mut track, mut decoder) = select_track(&*format, &dec_opts)?;
     let sample_rate = track.sample_rate;
 
     // Convert start/stop positions to frame numbers
@@ -273,13 +305,9 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // original position. Reopening is also the only reliable way to undo
             // a successful seek that overshot the requested start.
             format = open_format(path)?;
-            track = select_track(&*format)?;
+            (track, decoder) = select_track(&*format, &dec_opts)?;
         }
     }
-
-    let dec_opts: AudioDecoderOptions = Default::default();
-    let mut decoder =
-        symphonia::default::get_codecs().make_audio_decoder(&track.params, &dec_opts)?;
 
     let mut samples: Vec<F> = Vec::new();
     let mut layout: Option<Layout> = None;
@@ -325,15 +353,14 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // track list, and reading only continues if the new track is
             // compatible with what has been decoded so far.
             Err(Error::ResetRequired) => {
-                let next = select_track(&*format)?;
+                let (next, next_decoder) = select_track(&*format, &dec_opts)?;
                 if next.sample_rate != sample_rate {
                     return Err(ReadError::SampleRateChanged {
                         expected: sample_rate,
                         found: next.sample_rate,
                     });
                 }
-                decoder =
-                    symphonia::default::get_codecs().make_audio_decoder(&next.params, &dec_opts)?;
+                decoder = next_decoder;
                 track = next;
                 // Keep `position` for normal decoding, and retain the boundary as
                 // the base if a later error requires re-anchoring from this new
@@ -988,6 +1015,41 @@ mod tests {
                 "{path}: range {range:?} did not match the full decode"
             );
         }
+    }
+
+    /// The container marks an AC-3 track as default and symphonia has no AC-3
+    /// decoder, so the track exposes complete audio parameters yet cannot be
+    /// decoded. Selecting it on its parameters alone made the whole file
+    /// unreadable; the decodable PCM track must be used instead.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_unusable_default_track_falls_back_to_decodable_track() {
+        const PATH: &str = "test_data/test_unusable_default.mka";
+
+        // Assert the fixture still poses the problem. Without this the test
+        // would keep passing if the default track ever stopped being reported
+        // as an audio track with an undecodable codec.
+        let format = open_format(Path::new(PATH)).unwrap();
+        let params = format
+            .default_track(TrackType::Audio)
+            .and_then(|track| track.codec_params.as_ref())
+            .and_then(CodecParameters::audio)
+            .expect("fixture: default audio track must expose audio parameters");
+        assert!(
+            symphonia::default::get_codecs()
+                .make_audio_decoder(params, &AudioDecoderOptions::default())
+                .is_err(),
+            "fixture: default track is decodable, so it no longer exercises the fallback"
+        );
+
+        let audio = read::<f32>(PATH, ReadConfig::default()).unwrap();
+
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.num_channels, 1);
+        assert_eq!(audio.samples_interleaved.len(), 960);
     }
 
     /// Matroska timestamps are millisecond-based and therefore cannot position

@@ -26,12 +26,14 @@ Acceptance criteria:
 
 ## Reader correctness
 
-### [ ] Make default-track fallback reject null or unusable codecs
+### [x] Make default-track fallback reject null or unusable codecs
 
 **Priority:** Medium  
 **Relevant code:** `src/reader.rs:174-185`, `src/reader.rs:259-261`, `release-notes.md:10-13`
 
-`default_track(TrackType::Audio)` can return a default-marked track with audio parameters but a null codec ID. Checking only `codec_params.is_some()` accepts that track, so the fallback to `first_track_known_codec` is never attempted and decoder creation fails even if another audio track is usable.
+`default_track(TrackType::Audio)` can return a default-marked track whose codec is named by the demuxer but has no registered decoder, such as AC-3, DTS or TrueHD in Matroska, or a codec excluded by the enabled features. Checking only `codec_params.is_some()` accepts that track, so no other audio track is ever tried and decoder creation fails even if a usable one exists.
+
+The original report described this as a null codec ID passing the `codec_params.is_some()` check. That variant is not reachable with symphonia 0.6: only the Matroska demuxer sets the default-track flag, and it reports unknown codec IDs as absent codec parameters rather than as a null audio codec, which `default_track` already skips. Only the isomp4 demuxer produces `CODEC_ID_NULL_AUDIO`, and it never marks a default track. The null-codec check is therefore kept as a guard, but the reachable defect is the missing decoder-construction check.
 
 Acceptance criteria:
 

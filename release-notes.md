@@ -7,10 +7,11 @@
 - Time-based `start`/`stop` positions are now rounded to the nearest frame
   instead of being truncated. A selection can therefore shift by one frame
   compared to 0.4.x.
-- The audio track is now selected by asking the container for its default audio
-  track, falling back to the first audio track with a known codec. Previously
-  the first track with a non-null codec was used, so a file with several audio
-  tracks may now read a different one.
+- The audio track is now selected by trying the container's default audio track
+  first, then falling back through the remaining audio tracks until a decoder
+  can be constructed. Null, unsupported, and otherwise unusable codecs are
+  skipped. Previously the first track with a non-null codec was used, so a file
+  with several audio tracks may now read a different one.
 - Two `ReadError` variants were renamed, for consistency with the rest of the
   crate:
   - `InvalidChannel { index, total }` is now
