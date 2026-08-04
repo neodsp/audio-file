@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac", "mkv,flac"]
+        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac", "mkv,flac", "mp3"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

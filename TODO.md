@@ -118,6 +118,40 @@ Acceptance criteria:
 - `taplo fmt --check` ignores the generated `Cargo.toml` copies under `target/`.
 - Re-running the release workflow for an existing tag updates the release instead of failing.
 
+## Test coverage
+
+### [x] Fill the frames of a discarded packet and cover the recovery path
+
+- **Priority:** Medium
+- **Relevant code:** `src/reader.rs:511-530`, `src/reader.rs:604-624`
+
+A packet the decoder rejects was skipped and the position recovered from the next timestamp, but the frames it would have carried were not replaced. Everything after the hole therefore moved earlier in the output, so the read silently returned audio that no longer lined up with the requested frame positions. Corrupting one FLAC frame header in the 48 kHz Matroska fixture lost exactly one packet of 4608 frames.
+
+The hole is now filled with silence, capped by the frames the read can still produce so that a corrupt timestamp cannot request an enormous fill. A hole before the first copied frame is only filled when the read was not seeked, because after a seek the first packet may simply start later than requested and its frames were never lost.
+
+Acceptance criteria:
+
+- A discarded packet does not change the length of the read.
+- The frames around the hole stay at their own positions.
+- The hole is silent, and covers no more than the discarded packet.
+- The fill is bounded when the file length is unknown.
+
+### [x] Cover the remaining error paths and the seek decision
+
+- **Priority:** Medium
+- **Relevant code:** `src/reader.rs:585-604`, `src/reader.rs:140-144`, `src/reader.rs:556-576`
+
+`SampleRateChanged`, `TooManyChannels` and `NoChannels` had no test, `read_block` was only covered by a doc test, and the seek decision was an inline condition that no test could reach. The `u16` channel conversion and the channel-count fallback are now small functions, `should_seek` holds the seek decision, and a chained Ogg fixture changes its sample rate mid-stream.
+
+Note on the Matroska seek guard: it is not what makes Matroska reads correct. Measured on the new 48 kHz fixture, symphonia's accurate seek reports its landing honestly (288 ms for a 250 ms target), `seek_landing_is_safe` accepts it, and all ranges are correct even with the guard removed. The guard only avoids a seek attempt that would often be undone by reopening the file, so it is now documented as a performance choice and covered by a unit test of the decision. Dropping it would enable seeking for Matroska; that is a deliberate call to make, not an oversight.
+
+Acceptance criteria:
+
+- Every `ReadError` variant that a read can produce is covered by a test.
+- `read_block` is covered by a real test, not only by a doc example.
+- The seek decision is unit-tested, including the Matroska case.
+- The encoder delay and padding claim in `release-notes.md` has a fixture: the MP3 fixture reads back with the exact length of the encoded signal, and no frame shift fits the encoded signal better than no shift.
+
 ## Documentation
 
 ### [x] Correct the selective-decoding claim
@@ -144,7 +178,7 @@ After completing the tasks above, run:
 - [x] `cargo test --locked --all-features --all-targets --workspace`
 - [x] `cargo test --locked --doc --workspace`
 - [x] `cargo test --locked --all-features --doc --workspace`
-- [x] Reduced-feature tests with Symphonia defaults genuinely disabled, for `wav,pcm`, `ogg,vorbis`, `isomp4,aac` and `mkv,flac`
+- [x] Reduced-feature tests with Symphonia defaults genuinely disabled, for `wav,pcm`, `ogg,vorbis`, `isomp4,aac`, `mkv,flac` and `mp3`
 - [x] Compressed-format range regression tests
 - [x] `cargo +1.88.0 check --locked --all-features --all-targets --workspace` (MSRV)
 - [x] `cargo doc --locked --all-features --no-deps`
@@ -154,18 +188,14 @@ After completing the tasks above, run:
 
 ## Follow-ups, not release blocking
 
-- A packet that fails to decode is skipped and the position is recovered from the
-  next timestamp, but the lost frames are not filled, so everything after the gap
-  moves earlier in the returned buffer. Zero-filling the known gap would keep the
-  read frame-accurate. The recovery path has no test.
-- The `short_name != "matroska"` seek guard in `decode` is never exercised: all
-  Matroska fixtures are 44.1 kHz with a millisecond time base, so
-  `time_base_has_exact_frames` already rejects the seek. A 48 kHz FLAC-in-Matroska
-  fixture with ranges past the seek threshold would lock the guard in.
-- The encoder delay and padding handling that `release-notes.md` describes has no
-  fixture. It relies on symphonia signalling delay frames as a negative PTS plus
-  `trim_start`, which the MP3 and Vorbis decoders apply themselves.
-- `SampleRateChanged`, `TooManyChannels` and `NoChannels` have no test, and
-  `read_block` is only covered by a doc test.
 - `cargo package` ships this file and `utils/`. Consider removing `TODO.md` before
   tagging, or adding a `package.exclude` for the internal files.
+- The recovery after a discarded packet is only frame-exact when the timestamps
+  are: at 44.1 kHz in Matroska the millisecond timestamp locates the next packet
+  to within about 22 frames, so a hole in such a file can stay off by that much.
+  Nothing in the container can do better.
+- A hole before the first copied frame is not filled after a seek, so a format
+  reader that reported a safe landing but positioned itself after the requested
+  start would still produce a short read. Verifying the first anchored packet
+  against the requested start, and decoding again from the beginning when it is
+  too late, would close that gap and make the Matroska seek guard unnecessary.

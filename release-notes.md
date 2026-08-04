@@ -37,7 +37,9 @@
   early, giving codecs with inter-frame dependencies a fixed amount of time to
   warm up.
 - Malformed packets are skipped when the stream position can be recovered from
-  timestamps, instead of failing the whole read.
+  timestamps, instead of failing the whole read. The frames such a packet would
+  have carried are filled with silence, so that every later frame stays at its
+  own position instead of moving earlier by the number of missing frames.
 - Support for chained streams (e.g. concatenated OGG files): the decoder is
   rebuilt when the track list changes, and the timeline continues across
   streams.

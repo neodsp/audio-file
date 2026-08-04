@@ -133,9 +133,14 @@ pub fn read<F: Float + rubato::Sample>(
     Ok(Audio {
         samples_interleaved: samples,
         sample_rate: config.sample_rate.unwrap_or(decoded.sample_rate),
-        num_channels: u16::try_from(decoded.num_channels)
-            .map_err(|_| ReadError::TooManyChannels(decoded.num_channels))?,
+        num_channels: checked_num_channels(decoded.num_channels)?,
     })
+}
+
+/// The channel count is reported as a `u16`, so a stream with more channels than
+/// that cannot be described by [`Audio`].
+fn checked_num_channels(count: usize) -> Result<u16, ReadError> {
+    u16::try_from(count).map_err(|_| ReadError::TooManyChannels(count))
 }
 
 /// Decoded audio at the sample rate of the file, before any resampling.
@@ -333,17 +338,14 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         });
     }
 
-    // Seek for large offsets to avoid decoding data that is thrown away again.
-    // Below one second the seek overhead is not worth it, and decoding from the
-    // beginning while discarding samples is simpler.
     let mut seeked = false;
-    if start_frame > sample_rate as usize
-        && let Some(tb) = track.time_base
-        && time_base_has_exact_frames(tb, sample_rate)
-        // Symphonia's Matroska accurate seek may land several seconds after its
-        // target. Disable it explicitly until the demuxer can guarantee a safe
-        // landing; decoding from the beginning is slower but frame-correct.
-        && format.format_info().short_name != "matroska"
+    if let Some(tb) = track.time_base
+        && should_seek(
+            start_frame,
+            sample_rate,
+            tb,
+            format.format_info().short_name,
+        )
     {
         // Aim one second early to give codecs with inter-frame dependencies time
         // to warm up. Some format readers may still land after the requested
@@ -517,6 +519,28 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         };
 
         if copy_start < copy_end {
+            // Frames that were lost with a discarded packet leave a hole. Filling
+            // it with silence keeps every later frame at its own position in the
+            // output, instead of shifting the whole remainder of the read earlier
+            // by the number of missing frames.
+            //
+            // A hole before the first copied frame is only filled when the read
+            // was not seeked. After a seek the first packet may simply start
+            // later than requested, and its frames were never lost, so silence
+            // would be presented as audio that the file does have.
+            if copy_start > copied_until && (!seeked || copied_until > start_frame as u64) {
+                let missing = fill_frames(
+                    copy_start - copied_until,
+                    samples.len() / layout.count,
+                    layout.count,
+                    expected_frames(start_frame, end_frame, track.num_frames),
+                );
+                let len = samples
+                    .len()
+                    .saturating_add(missing.saturating_mul(layout.count));
+                samples.resize(len, F::zero());
+            }
+
             let first = (copy_start - packet_start) as usize;
             let last = (copy_end - packet_start) as usize;
 
@@ -547,23 +571,32 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         }
     }
 
-    // Fall back to and validate against the channel count of the probe, or of
-    // the container if the file has no decodable audio at all (for example, an
-    // empty WAV file).
-    let num_channels = match layout {
-        Some(layout) => layout.count,
-        None => fallback_channels
+    Ok(Decoded {
+        samples,
+        num_channels: resolve_num_channels(layout, fallback_channels, config)?,
+        sample_rate,
+    })
+}
+
+/// Number of channels the read produced.
+///
+/// The layout of the decoded audio decides it whenever the read decoded
+/// anything. Files without a single decoded frame, for example an empty WAV
+/// file, fall back to the probed or declared channel count, which is also
+/// validated so that an invalid selection is still rejected for them.
+fn resolve_num_channels(
+    layout: Option<Layout>,
+    fallback: Option<usize>,
+    config: &ReadConfig,
+) -> Result<usize, ReadError> {
+    match layout {
+        Some(layout) => Ok(layout.count),
+        None => fallback
             .map(|total| channel_range(config, total))
             .transpose()?
             .map(|(_, count)| count)
-            .ok_or(ReadError::NoChannels)?,
-    };
-
-    Ok(Decoded {
-        samples,
-        num_channels,
-        sample_rate,
-    })
+            .ok_or(ReadError::NoChannels),
+    }
 }
 
 fn extend_samples<F: Float>(samples: &mut Vec<F>, src: &[f64]) {
@@ -605,6 +638,22 @@ fn position_to_frame(position: Position, sample_rate: u32) -> Option<usize> {
     }
 }
 
+/// Number of silent frames to insert for a hole of `missing` frames, after
+/// `written` frames have been produced.
+///
+/// A corrupt timestamp could ask for an enormous hole, so the fill is capped by
+/// the frames the read can produce at all, and by the same budget as the
+/// preallocation when neither the stop position nor the file length bounds it. A
+/// capped fill leaves the output short, which a truncated file does as well.
+fn fill_frames(missing: u64, written: usize, channels: usize, max_frames: Option<usize>) -> usize {
+    let missing = usize::try_from(missing).unwrap_or(usize::MAX);
+    let limit = match max_frames {
+        Some(max) => max.saturating_sub(written),
+        None => MAX_PREALLOC_SAMPLES / channels.max(1),
+    };
+    missing.min(limit)
+}
+
 /// Number of frames the read is expected to yield, if the file length is known.
 fn expected_frames(start: usize, end: Option<usize>, n_frames: Option<u64>) -> Option<usize> {
     let total = n_frames.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
@@ -623,6 +672,28 @@ fn timestamp_to_frame(ts: i64, trim_start: u64, tb: TimeBase, sample_rate: u32) 
         / i128::from(tb.denom.get())
         + i128::from(trim_start);
     u64::try_from(frames).unwrap_or(if frames < 0 { 0 } else { u64::MAX })
+}
+
+/// Whether to seek to the requested start instead of decoding up to it.
+///
+/// Seeking avoids decoding data that is thrown away again, but it is only worth
+/// it, and only frame-exact, under all of these conditions:
+///
+/// - The offset is more than one second. Below that the seek overhead is not
+///   worth it, and decoding from the beginning while discarding samples is
+///   simpler.
+/// - Every timestamp tick maps to a whole number of audio frames, so that the
+///   seek target and the landing can be expressed exactly.
+/// - The container is not Matroska. Symphonia's Matroska accurate seek lands on
+///   a cue point that can be well after the requested target, and the read has
+///   to reopen the file and decode from the beginning whenever the landing turns
+///   out to be unusable, which is slower than not seeking in the first place.
+///   The landing is still validated for every container, so this only avoids the
+///   wasted attempt.
+fn should_seek(start_frame: usize, sample_rate: u32, tb: TimeBase, format_name: &str) -> bool {
+    start_frame > sample_rate as usize
+        && time_base_has_exact_frames(tb, sample_rate)
+        && format_name != "matroska"
 }
 
 /// Whether each timestamp tick maps to an exact audio-frame boundary.
@@ -1059,6 +1130,131 @@ mod tests {
         }
     }
 
+    /// LAME records its encoder delay and padding in the Xing header, symphonia
+    /// signals the delay frames with a negative PTS plus a start trim, and the
+    /// MP3 decoder drops them. Frame 0 of the read is therefore the first
+    /// playable frame, sample-aligned with the signal that was encoded.
+    #[cfg(any(feature = "all-codecs", feature = "mp3"))]
+    #[test]
+    fn test_mp3_encoder_delay_is_not_part_of_the_timeline() {
+        // The fixture encodes test_1ch.wav: one second of a 440 Hz sine at 48 kHz
+        const SAMPLE_RATE: f64 = 48_000.0;
+        const FREQUENCY: f64 = 440.0;
+        const N_FRAMES: usize = 48_000;
+
+        let mp3 = read::<f32>("test_data/test_mp3.mp3", ReadConfig::default()).unwrap();
+        assert_eq!(mp3.sample_rate, SAMPLE_RATE as u32);
+        assert_eq!(mp3.num_channels, 1);
+        // Delay and padding are not part of the timeline, so the length is the
+        // length of the encoded signal and not of the decoded frames
+        assert_eq!(mp3.samples_interleaved.len(), N_FRAMES);
+
+        let sine = |frame: usize| {
+            (2.0 * std::f64::consts::PI * FREQUENCY * frame as f64 / SAMPLE_RATE).sin() as f32
+        };
+        // Compare in the middle of the file, away from the lossy codec's edges
+        let error_at = |shift: i64| -> f32 {
+            (20_000..21_000)
+                .map(|frame| {
+                    let shifted = (frame as i64 + shift) as usize;
+                    (mp3.samples_interleaved[shifted] - sine(frame)).abs()
+                })
+                .fold(0.0, f32::max)
+        };
+
+        let aligned = error_at(0);
+        assert!(aligned < 0.05, "MP3 decoded too inaccurately: {aligned}");
+        // No shift reproduces the encoded signal better than no shift at all,
+        // which only holds if the delay frames were trimmed exactly
+        for shift in [-2, -1, 1, 2] {
+            assert!(
+                aligned < error_at(shift),
+                "shift {shift} fits better ({}) than no shift ({aligned})",
+                error_at(shift)
+            );
+        }
+    }
+
+    #[test]
+    fn test_seek_is_only_worth_it_for_exact_seekable_containers() {
+        let ms = TimeBase::try_new(1, 1_000).unwrap();
+
+        // Below one second, decoding from the beginning is simpler
+        assert!(!should_seek(48_000, 48_000, ms, "ogg"));
+        assert!(should_seek(48_001, 48_000, ms, "ogg"));
+        // 44.1 kHz has no whole number of frames per millisecond tick
+        assert!(!should_seek(100_000, 44_100, ms, "ogg"));
+        // Matroska lands on cue points, so the attempt is skipped for it
+        assert!(!should_seek(100_000, 48_000, ms, "matroska"));
+        assert!(should_seek(100_000, 48_000, ms, "wav"));
+    }
+
+    #[test]
+    fn test_channel_count_must_fit_the_reported_type() {
+        assert_eq!(checked_num_channels(2).unwrap(), 2);
+        assert_eq!(
+            checked_num_channels(usize::from(u16::MAX)).unwrap(),
+            u16::MAX
+        );
+
+        let error = checked_num_channels(usize::from(u16::MAX) + 1)
+            .expect_err("more channels than u16 can hold must be rejected");
+        assert!(
+            matches!(error, ReadError::TooManyChannels(65_536)),
+            "{error:?}"
+        );
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_num_channels_falls_back_when_nothing_was_decoded() {
+        let all = ReadConfig::default();
+
+        // The decoded layout wins over any fallback
+        let layout = Layout {
+            total: 4,
+            start: 1,
+            count: 2,
+        };
+        assert_eq!(
+            resolve_num_channels(Some(layout), Some(9), &all).unwrap(),
+            2
+        );
+
+        // Without decoded audio the fallback is used, and still validated
+        assert_eq!(resolve_num_channels(None, Some(2), &all).unwrap(), 2);
+        let too_many = ReadConfig {
+            num_channels: Some(3),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                resolve_num_channels(None, Some(2), &too_many),
+                Err(ReadError::InvalidChannelRange { total: 2, .. })
+            ),
+            "an invalid selection must be rejected without decoded audio too"
+        );
+
+        // Neither decoded nor declared, so the channel count is unknown
+        assert!(matches!(
+            resolve_num_channels(None, None, &all),
+            Err(ReadError::NoChannels)
+        ));
+    }
+
+    #[test]
+    fn test_gap_fill_is_bounded() {
+        // A hole inside a known length is filled completely
+        assert_eq!(fill_frames(100, 900, 2, Some(2_000)), 100);
+        // ... but never beyond the frames the read can still produce
+        assert_eq!(fill_frames(100, 1_950, 2, Some(2_000)), 50);
+        assert_eq!(fill_frames(100, 2_000, 2, Some(2_000)), 0);
+        // Without a known length, a bogus timestamp is capped by the same budget
+        // as the preallocation
+        assert_eq!(fill_frames(100, 0, 2, None), 100);
+        assert_eq!(fill_frames(u64::MAX, 0, 2, None), MAX_PREALLOC_SAMPLES / 2);
+    }
+
     #[test]
     fn test_exact_frame_time_bases() {
         assert!(time_base_has_exact_frames(
@@ -1263,6 +1459,94 @@ mod tests {
         );
     }
 
+    /// A packet the decoder rejects is discarded and the position is recovered
+    /// from the next timestamp. The frames of the discarded packet are lost, so
+    /// they have to be filled with silence: without the fill every later frame
+    /// moves earlier in the output and the read silently returns audio that no
+    /// longer lines up with the frame positions it was asked for.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    #[test]
+    fn test_discarded_packet_keeps_later_frames_aligned() {
+        // 48 kHz, so that the millisecond timestamp the position is recovered
+        // from is an exact frame boundary. At 44.1 kHz the recovered position is
+        // off by up to half a millisecond, which the fill cannot make up for.
+        const PATH: &str = "test_data/test_flac_48k.mka";
+        let intact = read::<f32>(PATH, ReadConfig::default())
+            .unwrap()
+            .samples_interleaved;
+        let source = std::fs::read(PATH).unwrap();
+
+        // A FLAC frame header is protected by a CRC-8, so flipping a bit in it
+        // makes the decoder reject that one packet while all the others stay
+        // decodable. The 14-bit sync word also occurs inside audio data, so try
+        // the candidates until one really loses a packet.
+        let syncs = (0..source.len() - 1)
+            .filter(|&i| source[i] == 0xFF && source[i + 1] & 0xFC == 0xF8)
+            .collect::<Vec<_>>();
+        assert!(!syncs.is_empty(), "fixture: no FLAC frame sync word found");
+
+        let path = std::env::temp_dir().join("audio-file-discarded-packet.mka");
+        for sync in syncs {
+            let mut damaged_source = source.clone();
+            damaged_source[sync + 3] ^= 0x0F;
+            std::fs::write(&path, &damaged_source).unwrap();
+
+            let Ok(damaged) = read::<f32>(&path, ReadConfig::default()) else {
+                continue;
+            };
+            let damaged = damaged.samples_interleaved;
+            let hole = silent_hole(&damaged, &intact);
+
+            // A discarded packet either leaves a silent hole, or, without the
+            // fill, a shorter read. Anything else only corrupted the audio of a
+            // packet that still decoded, which is not the case under test.
+            if damaged.len() == intact.len() && hole.is_none() {
+                continue;
+            }
+
+            assert_eq!(
+                damaged.len(),
+                intact.len(),
+                "the discarded packet shortened the read instead of leaving a hole"
+            );
+            let (gap_start, gap_end) = hole.expect("the hole must be silent");
+            assert!(
+                gap_end - gap_start < intact.len() / 4,
+                "more than one packet was discarded: {gap_start}..{gap_end}"
+            );
+            // Everything around the hole is still at its own position
+            assert_eq!(damaged[..gap_start], intact[..gap_start]);
+            assert_eq!(damaged[gap_end..], intact[gap_end..]);
+
+            std::fs::remove_file(&path).unwrap();
+            return;
+        }
+
+        panic!("no corrupted frame header made the decoder discard a packet");
+    }
+
+    /// The range `a` and `b` disagree over, if `a` is silent across all of it.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    fn silent_hole(a: &[f32], b: &[f32]) -> Option<(usize, usize)> {
+        let start = a.iter().zip(b).position(|(x, y)| x != y)?;
+        let trailing = a
+            .iter()
+            .rev()
+            .zip(b.iter().rev())
+            .position(|(x, y)| x != y)?;
+        let end = a.len() - trailing;
+        a[start..end]
+            .iter()
+            .all(|&s| s == 0.0)
+            .then_some((start, end))
+    }
+
     /// Chained Ogg streams may replace the decoder and decoded layout. A real
     /// channel-count change cannot be represented in one interleaved output.
     #[cfg(all(
@@ -1289,6 +1573,32 @@ mod tests {
         );
     }
 
+    /// A chained stream may also change its sample rate, which cannot be
+    /// represented in one buffer either and would play back at the wrong speed.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "ogg"),
+        any(feature = "all-codecs", feature = "vorbis")
+    ))]
+    #[test]
+    fn test_mid_stream_sample_rate_change_is_rejected() {
+        let error = read::<f32>(
+            "test_data/test_sample_rate_change.ogg",
+            ReadConfig::default(),
+        )
+        .expect_err("the chained stream changes from 48 kHz to 44.1 kHz");
+
+        assert!(
+            matches!(
+                error,
+                ReadError::SampleRateChanged {
+                    expected: 48_000,
+                    found: 44_100
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// Matroska timestamps are millisecond-based and therefore cannot position
     /// individual 44.1 kHz decoded buffers without rounding errors.
     #[cfg(all(
@@ -1300,6 +1610,22 @@ mod tests {
         assert_ranges_match_full_decode(
             "test_data/test_flac.mka",
             &[0..100, 4521..4621, 60_000..60_100],
+        );
+    }
+
+    /// At 48 kHz every Matroska millisecond tick is a whole number of frames, so
+    /// the seek decision is the only thing keeping this container off the seek
+    /// path. The ranges past the one-second threshold therefore cover the
+    /// anchoring for an exact time base as well.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    #[test]
+    fn test_flac_matroska_48k_frame_ranges() {
+        assert_ranges_match_full_decode(
+            "test_data/test_flac_48k.mka",
+            &[0..100, 48_001..48_101, 100_000..100_100, 143_900..144_000],
         );
     }
 
@@ -1407,6 +1733,31 @@ mod tests {
         }
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// `read_block` is the same read, wrapped in an interleaved audio block.
+    #[cfg(all(
+        feature = "audio-blocks",
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_read_block_matches_read() {
+        let config = || ReadConfig {
+            start: Position::Frame(1_000),
+            stop: Position::Frame(1_500),
+            start_channel: Some(1),
+            num_channels: Some(2),
+            ..Default::default()
+        };
+
+        let audio = read::<f32>("test_data/test_4ch.wav", config()).unwrap();
+        let (block, sample_rate) = read_block::<f32>("test_data/test_4ch.wav", config()).unwrap();
+
+        assert_eq!(sample_rate, audio.sample_rate);
+        assert_eq!(block.num_channels(), audio.num_channels);
+        assert_eq!(block.num_frames(), 500);
+        assert_eq!(block.raw_data(), audio.samples_interleaved.as_slice());
     }
 
     /// A file without audio frames must report the declared channel layout and

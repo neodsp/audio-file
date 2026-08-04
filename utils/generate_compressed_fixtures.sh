@@ -14,6 +14,19 @@ ffmpeg -y -stream_loop 2 -i test_data/test_1ch.wav -ar 44100 -map_metadata -1 \
 ffmpeg -y -stream_loop 2 -i test_data/test_1ch.wav -ar 48000 -map_metadata -1 \
     -c:a libvorbis -q:a 5 test_data/test_vorbis.ogg
 
+# 48 kHz in Matroska, where every millisecond tick is a whole number of frames.
+# The seek decision is then the only thing that keeps this container off the seek
+# path, so ranges past the one-second threshold cover the anchoring for an exact
+# time base as well.
+ffmpeg -y -stream_loop 2 -i test_data/test_1ch.wav -ar 48000 -map_metadata -1 \
+    -c:a flac test_data/test_flac_48k.mka
+
+# LAME records its encoder delay and padding in the Xing header, which symphonia
+# signals as a negative PTS plus a start trim, so frame 0 of the read has to be
+# the first playable frame rather than the first decoded one.
+ffmpeg -y -i test_data/test_1ch.wav -map_metadata -1 \
+    -c:a libmp3lame -q:a 5 test_data/test_mp3.mp3
+
 # Deliberately make Matroska's Channels element disagree with the authoritative
 # FLAC stream info. The generated element is `9f 81 02` (two channels); changing
 # its payload to one leaves the encoded FLAC stereo layout untouched.
@@ -57,6 +70,16 @@ ffmpeg -y -i test_data/test_4ch.wav -t 0.02 -ac 2 -map_metadata -1 \
 cat /tmp/audio-file-mono.ogg /tmp/audio-file-stereo.ogg \
     > test_data/test_channel_count_change.ogg
 rm /tmp/audio-file-mono.ogg /tmp/audio-file-stereo.ogg
+
+# The same for a sample rate that changes between the links of the chain, which
+# cannot be represented in a single buffer either.
+ffmpeg -y -i test_data/test_1ch.wav -t 0.02 -ar 48000 -map_metadata -1 \
+    -c:a libvorbis -q:a 3 /tmp/audio-file-48k.ogg
+ffmpeg -y -i test_data/test_1ch.wav -t 0.02 -ar 44100 -map_metadata -1 \
+    -c:a libvorbis -q:a 3 /tmp/audio-file-44k.ogg
+cat /tmp/audio-file-48k.ogg /tmp/audio-file-44k.ogg \
+    > test_data/test_sample_rate_change.ogg
+rm /tmp/audio-file-48k.ogg /tmp/audio-file-44k.ogg
 
 # Two audio tracks, the default one in a codec symphonia's Matroska demuxer
 # names but has no decoder for. Track selection has to skip it and fall back to
