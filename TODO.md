@@ -58,12 +58,12 @@ Acceptance criteria:
 
 ## Release automation
 
-### [ ] Align release workflow tags with the repository convention
+### [x] Align release workflow tags with the repository convention
 
 **Priority:** Medium  
 **Relevant code:** `.github/workflows/release.yml:3-6`
 
-The workflow currently triggers only for `v*` tags, while all existing release tags are unprefixed (`0.1.0` through `0.4.1`). Pushing `0.5.0` under the established convention will not run the workflow.
+Release tags remain unprefixed (`0.1.0`, `0.5.0`, etc.). The workflow now follows this established convention and compares the complete tag directly with the crate version.
 
 Acceptance criteria:
 
