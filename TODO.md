@@ -42,7 +42,7 @@ Acceptance criteria:
 - Add a multi-track regression test with an unusable default track and a usable alternate track.
 - Ensure `release-notes.md` describes the implemented selection behavior accurately.
 
-### [ ] Validate channel selection against the authoritative decoded layout
+### [x] Validate channel selection against the authoritative decoded layout
 
 **Priority:** Medium  
 **Relevant code:** `src/reader.rs:227-233`, `src/reader.rs:352-384`

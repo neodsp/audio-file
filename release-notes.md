@@ -50,8 +50,10 @@
   `[-max, max]`. This also fixes full-scale input turning into silence when
   writing `Int32` from `f32` samples, where the scale factor rounded up out of
   the `i32` range.
-- Channel selection is validated up front, so an invalid selection is rejected
-  even for files that contain no audio packets.
+- Channel selection is validated against the decoded channel layout, which is
+  authoritative, instead of against a possibly stale container declaration. For
+  files without any decoded audio the declared layout is still used, so an
+  invalid selection is rejected even then.
 - Files without audio frames now report the channel layout declared by the
   container instead of failing.
 - The output buffer is reserved up front from the frame count reported by the

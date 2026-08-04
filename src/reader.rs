@@ -261,13 +261,11 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         });
     }
 
-    // Validate the channel selection up front when the container declares a
-    // channel count. That way an invalid selection is rejected before anything
-    // is decoded, and also for files that contain no audio packets at all.
-    let declared = track
-        .channels
-        .map(|total| channel_range(config, total))
-        .transpose()?;
+    // The decoded specification is authoritative when packets are available.
+    // Retain the container declaration only as a fallback for files without any
+    // decoded audio, rather than rejecting a selection against a possibly stale
+    // metadata value before decoding starts.
+    let declared_channels = track.channels;
 
     // Seek for large offsets to avoid decoding data that is thrown away again.
     // Below one second the seek overhead is not worth it, and decoding from the
@@ -324,7 +322,8 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
 
     // Reserve up front when the container reports a frame count, so that long
     // reads don't repeatedly reallocate a growing buffer.
-    if let Some((_, ch_count)) = declared
+    if let Some(ch_count) = declared_channels
+        .and_then(|total| channel_range(config, total).ok().map(|(_, count)| count))
         && let Some(frames) = expected_frames(start_frame, end_frame, track.num_frames)
     {
         samples.reserve(frames.saturating_mul(ch_count).min(MAX_PREALLOC_SAMPLES));
@@ -491,12 +490,15 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         }
     }
 
-    // Fall back to the declared channel count for files without audio packets,
-    // so that an empty selection still reports a sane layout.
-    let num_channels = match (layout, declared) {
-        (Some(layout), _) => layout.count,
-        (None, Some((_, count))) => count,
-        (None, None) => return Err(ReadError::NoChannels),
+    // Fall back to and validate against the declared channel count only if no
+    // decoded specification was available (for example, an empty WAV file).
+    let num_channels = match layout {
+        Some(layout) => layout.count,
+        None => declared_channels
+            .map(|total| channel_range(config, total))
+            .transpose()?
+            .map(|(_, count)| count)
+            .ok_or(ReadError::NoChannels)?,
     };
 
     Ok(Decoded {
@@ -1050,6 +1052,76 @@ mod tests {
         assert_eq!(audio.sample_rate, 48_000);
         assert_eq!(audio.num_channels, 1);
         assert_eq!(audio.samples_interleaved.len(), 960);
+    }
+
+    /// The Matroska track metadata declares mono while the FLAC stream info
+    /// declares stereo. Channel selection must follow the decoded FLAC layout.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    #[test]
+    fn test_channel_selection_uses_decoded_layout() {
+        const PATH: &str = "test_data/test_declared_mono_decoded_stereo.mka";
+
+        // Assert the fixture still contains the intended metadata disagreement.
+        let format = open_format(Path::new(PATH)).unwrap();
+        let declared_channels = format
+            .default_track(TrackType::Audio)
+            .and_then(|track| track.codec_params.as_ref())
+            .and_then(CodecParameters::audio)
+            .and_then(|params| params.channels.as_ref())
+            .map(Channels::count);
+        assert_eq!(declared_channels, Some(1));
+
+        let full = read::<f32>(PATH, ReadConfig::default()).unwrap();
+        assert_eq!(full.num_channels, 2);
+        assert!(!full.samples_interleaved.is_empty());
+
+        // This selection is invalid against the declared mono layout but valid
+        // against the authoritative decoded stereo layout.
+        let selected = read::<f32>(
+            PATH,
+            ReadConfig {
+                start_channel: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.num_channels, 1);
+        assert_eq!(
+            selected.samples_interleaved,
+            full.samples_interleaved
+                .chunks_exact(2)
+                .map(|frame| frame[1])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Chained Ogg streams may replace the decoder and decoded layout. A real
+    /// channel-count change cannot be represented in one interleaved output.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "ogg"),
+        any(feature = "all-codecs", feature = "vorbis")
+    ))]
+    #[test]
+    fn test_mid_stream_channel_count_change_is_rejected() {
+        let error = read::<f32>(
+            "test_data/test_channel_count_change.ogg",
+            ReadConfig::default(),
+        )
+        .expect_err("the chained stream changes from mono to stereo");
+
+        assert!(
+            matches!(
+                error,
+                ReadError::ChannelCountChanged {
+                    expected: 1,
+                    found: 2
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     /// Matroska timestamps are millisecond-based and therefore cannot position
