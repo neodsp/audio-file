@@ -115,7 +115,8 @@
 //! - Start channel and number of channels
 //! - Optional resampling
 //!
-//! The crate only decodes and stores the parts that you selected.
+//! Only selected frames are stored. The reader may decode and discard earlier packets for accurate
+//! seeking and codec warm-up.
 //!
 //! The start position is inclusive and the stop position is exclusive, so reading from frame 300
 //! to frame 400 yields 100 frames. Frame 0 is the first playable frame: encoder delay and padding,
