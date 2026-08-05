@@ -230,67 +230,76 @@ fn prepare_track(
     Ok(Some((info, decoder)))
 }
 
-/// Audio specification of the decoded audio, as opposed to the one the
-/// container declares.
+/// Everything about a read that can only be resolved once the audio
+/// specification is known: the frame positions depend on the sample rate, and
+/// the channel selection on the channel count.
+///
+/// It is resolved from the first packet that decodes, because container metadata
+/// can contradict the bitstream headers. A Matroska `SamplingFrequency` element
+/// may disagree with the FLAC stream info it wraps, symphonia's demuxers report
+/// the container value, and only some decoders amend their codec parameters with
+/// what they read from the bitstream. The specification of decoded audio is
+/// therefore the only reliable source, and the declared one is used only for
+/// files without a single decodable packet.
 #[derive(Clone, Copy)]
-struct DecodedSpec {
+struct Plan {
     sample_rate: u32,
-    channels: usize,
+    layout: Layout,
+    /// First frame to copy, inclusive
+    start_frame: usize,
+    /// Frame to stop before, if the read is bounded
+    end_frame: Option<usize>,
 }
 
-/// Decode packets until the decoder reports the specification of its output.
-///
-/// Container metadata can contradict the bitstream headers, for example a
-/// Matroska `SamplingFrequency` element that disagrees with the FLAC stream
-/// info, and symphonia's demuxers report the container value. Only some
-/// decoders amend their codec parameters with what they read from the
-/// bitstream, so the specification of a decoded packet is the only reliable
-/// source. `None` means the file has no decodable audio packet at all, in which
-/// case the container declaration is all there is.
-fn probe_decoded_spec(
-    path: &Path,
-    dec_opts: &AudioDecoderOptions,
-) -> Result<Option<DecodedSpec>, ReadError> {
-    let mut format = open_format(path)?;
-    let (mut track, mut decoder) = select_track(&*format, dec_opts)?;
+impl Plan {
+    /// Resolve and validate the read config against an audio specification.
+    fn resolve(sample_rate: u32, channels: usize, config: &ReadConfig) -> Result<Self, ReadError> {
+        let start_frame = position_to_frame(config.start, sample_rate).unwrap_or(0);
+        let end_frame = position_to_frame(config.stop, sample_rate);
 
-    loop {
-        let packet = match format.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => return Ok(None),
-            // A chained stream starts a new track list before the first packet
-            // of the previous one could be decoded.
-            Err(Error::ResetRequired) => {
-                (track, decoder) = select_track(&*format, dec_opts)?;
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        if packet.track_id != track.id {
-            continue;
+        if let Some(end_frame) = end_frame
+            && start_frame > end_frame
+        {
+            return Err(ReadError::InvalidFrameRange {
+                start: start_frame,
+                end: end_frame,
+            });
         }
 
-        // A warm-up packet without any frames still carries the specification
-        // the decoder was configured with, so it does not have to be skipped.
-        match decoder.decode(&packet) {
-            Ok(decoded) => {
-                return Ok(Some(DecodedSpec {
-                    sample_rate: decoded.spec().rate(),
-                    channels: decoded.spec().channels().count(),
-                }));
-            }
-            // Discardable packets are skipped here for the same reason as
-            // during the read itself, so that one malformed packet at the start
-            // of a file does not hide the specification of all the others.
-            Err(Error::DecodeError(_) | Error::IoError(_)) => continue,
-            Err(Error::ResetRequired) => {
-                decoder.reset();
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        }
+        let (start, count) = channel_range(config, channels)?;
+
+        Ok(Self {
+            sample_rate,
+            layout: Layout {
+                total: channels,
+                start,
+                count,
+            },
+            start_frame,
+            end_frame,
+        })
     }
+
+    /// Number of frames the read is expected to yield, if the file length is
+    /// known.
+    fn expected_frames(&self, num_frames: Option<u64>) -> Option<usize> {
+        let total = num_frames.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+        let end = match (self.end_frame, total) {
+            (Some(end), Some(total)) => end.min(total),
+            (Some(end), None) => end,
+            (None, Some(total)) => total,
+            (None, None) => return None,
+        };
+        Some(end.saturating_sub(self.start_frame))
+    }
+}
+
+/// Plan for a file without a single decodable packet, for example an empty WAV
+/// file. The container declaration is all there is, and the config is still
+/// validated against it so that an invalid selection is rejected.
+fn declared_plan(track: &TrackInfo, config: &ReadConfig) -> Result<Plan, ReadError> {
+    let channels = track.channels.ok_or(ReadError::NoChannels)?;
+    Plan::resolve(track.sample_rate, channels, config)
 }
 
 fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
@@ -315,95 +324,30 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     let dec_opts: AudioDecoderOptions = Default::default();
     let (mut track, mut decoder) = select_track(&*format, &dec_opts)?;
 
-    // The decoded specification is authoritative when packets are available.
-    // Every frame position, the returned sample rate, and the resampling ratio
-    // are resolved against the audio that is really produced, rather than
-    // against a container declaration that may disagree with the bitstream. The
-    // declaration is retained only as a fallback for files without any decoded
-    // audio.
-    let probed = probe_decoded_spec(path, &dec_opts)?;
-    let sample_rate = probed.map_or(track.sample_rate, |spec| spec.sample_rate);
-    let fallback_channels = probed.map(|spec| spec.channels).or(track.channels);
-
-    // Convert start/stop positions to frame numbers
-    let start_frame = position_to_frame(config.start, sample_rate).unwrap_or(0);
-    let end_frame = position_to_frame(config.stop, sample_rate);
-
-    if let Some(end_frame) = end_frame
-        && start_frame > end_frame
-    {
-        return Err(ReadError::InvalidFrameRange {
-            start: start_frame,
-            end: end_frame,
-        });
-    }
-
-    let mut seeked = false;
-    if let Some(tb) = track.time_base
-        && should_seek(
-            start_frame,
-            sample_rate,
-            tb,
-            format.format_info().short_name,
-        )
-    {
-        // Aim one second early to give codecs with inter-frame dependencies time
-        // to warm up. Some format readers may still land after the requested
-        // start despite `SeekMode::Accurate`; such a seek cannot produce the full
-        // requested range and is discarded below.
-        let target = start_frame.saturating_sub(sample_rate as usize) as u64;
-        let ts = i64::try_from(frames_to_ts(target, tb, sample_rate)).unwrap_or(i64::MAX);
-
-        let seek_result = format.seek(
-            SeekMode::Accurate,
-            SeekTo::Timestamp {
-                ts: Timestamp::new(ts),
-                track_id: track.id,
-            },
-        );
-
-        if let Ok(result) = seek_result
-            && seek_landing_is_safe(result.actual_ts.get(), start_frame as u64, tb, sample_rate)
-        {
-            seeked = true;
-        } else {
-            // A failed seek is not guaranteed to leave every format reader at its
-            // original position. Reopening is also the only reliable way to undo
-            // a successful seek that overshot the requested start.
-            format = open_format(path)?;
-            (track, decoder) = select_track(&*format, &dec_opts)?;
-        }
-    }
-
     let mut samples: Vec<F> = Vec::new();
-    let mut layout: Option<Layout> = None;
 
     // Reused per packet to hold the selected frames of the decoded audio.
     // `f64` is used because it can hold every sample format symphonia decodes
     // to without losing precision.
     let mut scratch: Vec<f64> = Vec::new();
 
-    // Reserve up front when the container reports a frame count, so that long
-    // reads don't repeatedly reallocate a growing buffer.
-    if let Some(ch_count) = fallback_channels
-        .and_then(|total| channel_range(config, total).ok().map(|(_, count)| count))
-        && let Some(frames) = expected_frames(start_frame, end_frame, track.num_frames)
-    {
-        samples.reserve(frames.saturating_mul(ch_count).min(MAX_PREALLOC_SAMPLES));
-    }
+    // Resolved from the first packet that decodes, see `Plan`.
+    let mut plan: Option<Plan> = None;
+    let mut seeked = false;
 
     // Absolute frame index of the next decoded frame. Decoding from the beginning
     // has an exact zero anchor. After a successful seek (or a discontinuity), one
     // packet timestamp establishes a new anchor; decoded frame counts advance it
     // from then on. Re-anchoring every packet would turn timestamp quantization
     // into overlaps or gaps.
-    let mut position = if seeked { None } else { Some(0) };
+    let mut position = Some(0);
     // Offset for re-anchoring within a chained stream, whose packet timestamps
     // restart at zero even though its decoded frames continue the output.
     let mut stream_base = 0u64;
     // Never copy the same absolute frame twice if timestamp-based recovery after
-    // a decode error lands before data that was already returned.
-    let mut copied_until = start_frame as u64;
+    // a decode error lands before data that was already returned. Set to the
+    // start frame as soon as the plan is resolved.
+    let mut copied_until = 0u64;
 
     loop {
         let packet = match format.next_packet() {
@@ -416,9 +360,11 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // compatible with what has been decoded so far.
             Err(Error::ResetRequired) => {
                 let (next, next_decoder) = select_track(&*format, &dec_opts)?;
-                if next.sample_rate != sample_rate {
+                if let Some(plan) = plan
+                    && next.sample_rate != plan.sample_rate
+                {
                     return Err(ReadError::SampleRateChanged {
-                        expected: sample_rate,
+                        expected: plan.sample_rate,
                         found: next.sample_rate,
                     });
                 }
@@ -460,37 +406,91 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Err(err) => return Err(err.into()),
         };
 
-        // The decoded specification has to stay stable, otherwise the frames of
-        // this packet do not belong to the same stream as everything that was
-        // decoded before. A rate that differs from the probed one also
-        // invalidates every frame position that was resolved from it.
         let packet_rate = decoded.spec().rate();
-        if packet_rate != sample_rate {
-            return Err(ReadError::SampleRateChanged {
-                expected: sample_rate,
-                found: packet_rate,
-            });
-        }
+        let packet_channels = decoded.spec().channels().count();
 
-        let total_channels = decoded.spec().channels().count();
-        let layout = match layout {
-            Some(known) if known.total != total_channels => {
-                return Err(ReadError::ChannelCountChanged {
-                    expected: known.total,
-                    found: total_channels,
-                });
+        let plan = match plan {
+            // The decoded specification has to stay stable, otherwise the frames
+            // of this packet do not belong to the same stream as everything that
+            // was decoded before. A rate that differs also invalidates every
+            // frame position that was resolved from it.
+            Some(known) => {
+                if packet_rate != known.sample_rate {
+                    return Err(ReadError::SampleRateChanged {
+                        expected: known.sample_rate,
+                        found: packet_rate,
+                    });
+                }
+                if packet_channels != known.layout.total {
+                    return Err(ReadError::ChannelCountChanged {
+                        expected: known.layout.total,
+                        found: packet_channels,
+                    });
+                }
+                known
             }
-            Some(known) => known,
+            // The first decoded packet is what the whole read is resolved
+            // against. A warm-up packet without any frames already carries the
+            // specification the decoder was configured with, so it resolves the
+            // plan just as well as a packet with audio in it.
             None => {
-                let (start, count) = channel_range(config, total_channels)?;
-                *layout.insert(Layout {
-                    total: total_channels,
-                    start,
-                    count,
-                })
+                let resolved = Plan::resolve(packet_rate, packet_channels, config)?;
+                copied_until = resolved.start_frame as u64;
+
+                // Reserve up front when the container reports a frame count, so
+                // that long reads don't repeatedly reallocate a growing buffer.
+                if let Some(frames) = resolved.expected_frames(track.num_frames) {
+                    samples.reserve(
+                        frames
+                            .saturating_mul(resolved.layout.count)
+                            .min(MAX_PREALLOC_SAMPLES),
+                    );
+                }
+
+                // Seeking can only be decided here, because the frame positions
+                // it needs are resolved against the sample rate of this packet.
+                // The frames of this packet are given up with the seek, and they
+                // lie before its target anyway.
+                if let Some(tb) = track.time_base
+                    && should_seek(
+                        resolved.start_frame,
+                        resolved.sample_rate,
+                        tb,
+                        format.format_info().short_name,
+                    )
+                {
+                    if seek_before(
+                        &mut *format,
+                        track.id,
+                        resolved.start_frame,
+                        resolved.sample_rate,
+                        tb,
+                    ) {
+                        // The decoder keeps state from before the landing, and
+                        // the frames after it can no longer be counted from the
+                        // beginning of the file.
+                        decoder.reset();
+                        position = None;
+                        seeked = true;
+                    } else {
+                        // A failed seek is not guaranteed to leave every format
+                        // reader at its original position. Reopening is also the
+                        // only reliable way to undo a successful seek that
+                        // overshot the requested start, and it decodes this
+                        // packet again from a known position.
+                        format = open_format(path)?;
+                        (track, decoder) = select_track(&*format, &dec_opts)?;
+                        position = Some(0);
+                    }
+                    plan = Some(resolved);
+                    continue;
+                }
+
+                *plan.insert(resolved)
             }
         };
 
+        let layout = plan.layout;
         let packet_frames = decoded.frames();
 
         // Decoder output is continuous after it has been anchored. At a
@@ -504,7 +504,7 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                     packet.pts.get(),
                     packet.trim_start.get(),
                     tb,
-                    sample_rate,
+                    plan.sample_rate,
                 )),
                 None => stream_base,
             },
@@ -512,8 +512,8 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
         let packet_end = packet_start.saturating_add(packet_frames as u64);
 
         // Intersect the packet with the requested frame range
-        let copy_start = packet_start.max(start_frame as u64).max(copied_until);
-        let copy_end = match end_frame {
+        let copy_start = packet_start.max(plan.start_frame as u64).max(copied_until);
+        let copy_end = match plan.end_frame {
             Some(end) => packet_end.min(end as u64),
             None => packet_end,
         };
@@ -528,12 +528,12 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // was not seeked. After a seek the first packet may simply start
             // later than requested, and its frames were never lost, so silence
             // would be presented as audio that the file does have.
-            if copy_start > copied_until && (!seeked || copied_until > start_frame as u64) {
+            if copy_start > copied_until && (!seeked || copied_until > plan.start_frame as u64) {
                 let missing = fill_frames(
                     copy_start - copied_until,
                     samples.len() / layout.count,
                     layout.count,
-                    expected_frames(start_frame, end_frame, track.num_frames),
+                    plan.expected_frames(track.num_frames),
                 );
                 let len = samples
                     .len()
@@ -548,54 +548,49 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // scratch buffer, then take the selected frames out of it.
             scratch.resize(decoded.samples_interleaved(), 0.0);
             decoded.copy_to_slice_interleaved::<f64, _>(scratch.as_mut_slice());
-            let frames = &scratch[first * layout.total..last * layout.total];
+            append_selected(&mut samples, &scratch, layout, first..last);
 
-            if layout.start == 0 && layout.count == layout.total {
-                // All channels are selected, so nothing has to be dropped
-                extend_samples(&mut samples, frames);
-            } else {
-                for frame in frames.chunks_exact(layout.total) {
-                    let selected = &frame[layout.start..layout.start + layout.count];
-                    extend_samples(&mut samples, selected);
-                }
-            }
             copied_until = copy_end;
         }
 
         position = Some(packet_end);
 
-        if let Some(end) = end_frame
+        if let Some(end) = plan.end_frame
             && packet_end >= end as u64
         {
             break;
         }
     }
 
+    let plan = match plan {
+        Some(plan) => plan,
+        None => declared_plan(&track, config)?,
+    };
+
     Ok(Decoded {
         samples,
-        num_channels: resolve_num_channels(layout, fallback_channels, config)?,
-        sample_rate,
+        num_channels: plan.layout.count,
+        sample_rate: plan.sample_rate,
     })
 }
 
-/// Number of channels the read produced.
-///
-/// The layout of the decoded audio decides it whenever the read decoded
-/// anything. Files without a single decoded frame, for example an empty WAV
-/// file, fall back to the probed or declared channel count, which is also
-/// validated so that an invalid selection is still rejected for them.
-fn resolve_num_channels(
-    layout: Option<Layout>,
-    fallback: Option<usize>,
-    config: &ReadConfig,
-) -> Result<usize, ReadError> {
-    match layout {
-        Some(layout) => Ok(layout.count),
-        None => fallback
-            .map(|total| channel_range(config, total))
-            .transpose()?
-            .map(|(_, count)| count)
-            .ok_or(ReadError::NoChannels),
+/// Append the selected channels of the frames `frames` of an interleaved buffer
+/// to the output.
+fn append_selected<F: Float>(
+    samples: &mut Vec<F>,
+    interleaved: &[f64],
+    layout: Layout,
+    frames: std::ops::Range<usize>,
+) {
+    let selected = &interleaved[frames.start * layout.total..frames.end * layout.total];
+
+    if layout.start == 0 && layout.count == layout.total {
+        // All channels are selected, so nothing has to be dropped
+        extend_samples(samples, selected);
+    } else {
+        for frame in selected.chunks_exact(layout.total) {
+            extend_samples(samples, &frame[layout.start..layout.start + layout.count]);
+        }
     }
 }
 
@@ -654,18 +649,6 @@ fn fill_frames(missing: u64, written: usize, channels: usize, max_frames: Option
     missing.min(limit)
 }
 
-/// Number of frames the read is expected to yield, if the file length is known.
-fn expected_frames(start: usize, end: Option<usize>, n_frames: Option<u64>) -> Option<usize> {
-    let total = n_frames.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-    let end = match (end, total) {
-        (Some(end), Some(total)) => end.min(total),
-        (Some(end), None) => end,
-        (None, Some(total)) => total,
-        (None, None) => return None,
-    };
-    Some(end.saturating_sub(start))
-}
-
 /// Frame index that a signed timestamp and subsequent frame trim refer to.
 fn timestamp_to_frame(ts: i64, trim_start: u64, tb: TimeBase, sample_rate: u32) -> u64 {
     let frames = i128::from(ts) * i128::from(tb.numer.get()) * i128::from(sample_rate)
@@ -694,6 +677,37 @@ fn should_seek(start_frame: usize, sample_rate: u32, tb: TimeBase, format_name: 
     start_frame > sample_rate as usize
         && time_base_has_exact_frames(tb, sample_rate)
         && format_name != "matroska"
+}
+
+/// Seek so that `start_frame` can still be decoded, and report whether the
+/// landing is usable.
+///
+/// The seek aims one second early to give codecs with inter-frame dependencies
+/// time to warm up. Some format readers still land after the requested start
+/// despite [`SeekMode::Accurate`]; such a landing cannot produce the full
+/// requested range, and neither can a seek that failed outright. Both leave the
+/// format reader at an unspecified position, so a `false` return means the caller
+/// has to reopen the file.
+fn seek_before(
+    format: &mut dyn FormatReader,
+    track_id: u32,
+    start_frame: usize,
+    sample_rate: u32,
+    tb: TimeBase,
+) -> bool {
+    let target = start_frame.saturating_sub(sample_rate as usize) as u64;
+    let ts = i64::try_from(frames_to_ts(target, tb, sample_rate)).unwrap_or(i64::MAX);
+
+    let result = format.seek(
+        SeekMode::Accurate,
+        SeekTo::Timestamp {
+            ts: Timestamp::new(ts),
+            track_id,
+        },
+    );
+
+    matches!(result, Ok(landing)
+        if seek_landing_is_safe(landing.actual_ts.get(), start_frame as u64, tb, sample_rate))
 }
 
 /// Whether each timestamp tick maps to an exact audio-frame boundary.
@@ -1207,37 +1221,130 @@ mod tests {
     }
 
     #[test]
-    fn test_num_channels_falls_back_when_nothing_was_decoded() {
-        let all = ReadConfig::default();
-
-        // The decoded layout wins over any fallback
-        let layout = Layout {
-            total: 4,
-            start: 1,
-            count: 2,
+    fn test_plan_is_resolved_against_the_given_specification() {
+        let config = ReadConfig {
+            start: Position::Time(std::time::Duration::from_millis(10)),
+            stop: Position::Time(std::time::Duration::from_millis(20)),
+            start_channel: Some(1),
+            num_channels: Some(2),
+            ..Default::default()
         };
-        assert_eq!(
-            resolve_num_channels(Some(layout), Some(9), &all).unwrap(),
-            2
-        );
 
-        // Without decoded audio the fallback is used, and still validated
-        assert_eq!(resolve_num_channels(None, Some(2), &all).unwrap(), 2);
+        // Frame positions follow the given sample rate, not the config
+        let plan = Plan::resolve(48_000, 4, &config).unwrap();
+        assert_eq!(plan.sample_rate, 48_000);
+        assert_eq!(plan.start_frame, 480);
+        assert_eq!(plan.end_frame, Some(960));
+        assert_eq!(plan.layout.total, 4);
+        assert_eq!(plan.layout.start, 1);
+        assert_eq!(plan.layout.count, 2);
+
+        let plan = Plan::resolve(24_000, 4, &config).unwrap();
+        assert_eq!(plan.start_frame, 240);
+        assert_eq!(plan.end_frame, Some(480));
+
+        // The channel selection is validated against the given channel count
+        assert!(matches!(
+            Plan::resolve(48_000, 2, &config),
+            Err(ReadError::InvalidChannelRange {
+                start: 1,
+                count: 2,
+                total: 2
+            })
+        ));
+
+        let backwards = ReadConfig {
+            start: Position::Frame(100),
+            stop: Position::Frame(99),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Plan::resolve(48_000, 1, &backwards),
+            Err(ReadError::InvalidFrameRange {
+                start: 100,
+                end: 99
+            })
+        ));
+    }
+
+    #[test]
+    fn test_only_the_selected_channels_of_the_selected_frames_are_appended() {
+        // Three frames of four channels, one digit per channel
+        let interleaved: Vec<f64> = (0..12).map(f64::from).collect();
+        let layout = |start, count| Layout {
+            total: 4,
+            start,
+            count,
+        };
+
+        let mut all = Vec::new();
+        append_selected::<f32>(&mut all, &interleaved, layout(0, 4), 0..3);
+        assert_eq!(all, (0..12).map(|s| s as f32).collect::<Vec<_>>());
+
+        // Appending keeps what is already in the output
+        append_selected::<f32>(&mut all, &interleaved, layout(1, 2), 1..3);
+        assert_eq!(all[12..], [5.0, 6.0, 9.0, 10.0]);
+
+        // The last channels of the last frame
+        let mut tail = Vec::new();
+        append_selected::<f32>(&mut tail, &interleaved, layout(2, 2), 2..3);
+        assert_eq!(tail, [10.0, 11.0]);
+
+        // An empty frame range appends nothing
+        let mut none = Vec::new();
+        append_selected::<f32>(&mut none, &interleaved, layout(0, 4), 1..1);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_expected_frames_is_bounded_by_the_file_length() {
+        let bounded = Plan::resolve(
+            48_000,
+            2,
+            &ReadConfig {
+                start: Position::Frame(100),
+                stop: Position::Frame(600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.expected_frames(None), Some(500));
+        // A file that ends before the stop position bounds the read
+        assert_eq!(bounded.expected_frames(Some(300)), Some(200));
+        assert_eq!(bounded.expected_frames(Some(50)), Some(0));
+
+        let unbounded = Plan::resolve(48_000, 2, &ReadConfig::default()).unwrap();
+        assert_eq!(unbounded.expected_frames(None), None);
+        assert_eq!(unbounded.expected_frames(Some(300)), Some(300));
+    }
+
+    #[test]
+    fn test_declared_plan_is_used_when_nothing_was_decoded() {
+        let track = |channels| TrackInfo {
+            id: 0,
+            sample_rate: 48_000,
+            channels,
+            time_base: None,
+            num_frames: None,
+        };
+
+        let plan = declared_plan(&track(Some(2)), &ReadConfig::default()).unwrap();
+        assert_eq!(plan.sample_rate, 48_000);
+        assert_eq!(plan.layout.count, 2);
+
+        // An invalid selection is rejected without decoded audio too
         let too_many = ReadConfig {
             num_channels: Some(3),
             ..Default::default()
         };
-        assert!(
-            matches!(
-                resolve_num_channels(None, Some(2), &too_many),
-                Err(ReadError::InvalidChannelRange { total: 2, .. })
-            ),
-            "an invalid selection must be rejected without decoded audio too"
-        );
+        assert!(matches!(
+            declared_plan(&track(Some(2)), &too_many),
+            Err(ReadError::InvalidChannelRange { total: 2, .. })
+        ));
 
         // Neither decoded nor declared, so the channel count is unknown
         assert!(matches!(
-            resolve_num_channels(None, None, &all),
+            declared_plan(&track(None), &ReadConfig::default()),
             Err(ReadError::NoChannels)
         ));
     }
