@@ -261,11 +261,12 @@ pub use audio_blocks::*;
 #[cfg(feature = "audio-blocks")]
 pub use reader::read_block;
 pub use reader::{Audio, Position, ReadConfig, ReadError, read};
+pub use resample::ResampleError;
 #[cfg(feature = "audio-blocks")]
 pub use writer::write_block;
 pub use writer::{SampleFormat, WriteConfig, WriteError, write};
 
 pub mod reader;
-pub mod resample;
+mod resample;
 mod wav;
 pub mod writer;

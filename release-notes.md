@@ -2,8 +2,8 @@
 
 - Upgraded to `symphonia` 0.6 and `rubato` 4. Both are part of the public API,
   through `ReadError::Decode`, the `ResampleError` variants, and the
-  `rubato::Sample` bound on `read`, `read_block`, and `resample`, so callers
-  have to move to the same major versions.
+  `rubato::Sample` bound on `read` and `read_block`, so callers have to move to
+  the same major versions.
 - Time-based `start`/`stop` positions are now rounded to the nearest frame
   instead of being truncated. A selection can therefore shift by one frame
   compared to 0.4.x.
@@ -27,6 +27,11 @@
 - `hound` is no longer a dependency. Wav files are encoded by this crate, so
   `WriteError::Encode(hound::Error)` is gone and I/O failures are reported as
   `WriteError::Io(std::io::Error)` instead.
+- The `resample` module is no longer public. Resampling is an implementation
+  detail of the `sample_rate` read option, and standalone resampling is better
+  served by `rubato` directly. `ResampleError` stays public because
+  `ReadError::Resample` carries it, but its path changed from
+  `audio_file::resample::ResampleError` to `audio_file::ResampleError`.
 
 ## Improvements
 

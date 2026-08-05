@@ -16,7 +16,9 @@ pub enum ResampleError {
 }
 
 /// Resample interleaved audio from `sr_in` to `sr_out`.
-pub fn resample<F: Float + rubato::Sample>(
+///
+/// `audio_interleaved` must be frame aligned, which the reader guarantees.
+pub(crate) fn resample<F: Float + rubato::Sample>(
     audio_interleaved: &[F],
     num_channels: usize,
     sr_in: u32,
