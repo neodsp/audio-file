@@ -248,4 +248,5 @@ pub use writer::{SampleFormat, WriteConfig, WriteError, write};
 
 pub mod reader;
 pub mod resample;
+mod wav;
 pub mod writer;

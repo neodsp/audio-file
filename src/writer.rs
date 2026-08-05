@@ -1,19 +1,31 @@
+use std::fs::File;
 use std::path::Path;
 
 use num::Float;
 use thiserror::Error;
 
+use crate::wav;
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WriteError {
-    #[error("could not encode audio")]
-    Encode(#[from] hound::Error),
+    #[error("could not write file")]
+    Io(#[from] std::io::Error),
 
     #[error("channel count must not be zero")]
     ZeroChannels,
 
     #[error("sample count ({samples}) is not a multiple of the channel count ({channels})")]
     UnalignedSamples { samples: usize, channels: u16 },
+
+    #[error("file size ({bytes} bytes) exceeds the 4 GiB limit of the wav format")]
+    FileTooLarge { bytes: u64 },
+
+    #[error("frame size ({bytes} bytes) exceeds the 65535 byte limit of the wav format")]
+    FrameTooLarge { bytes: u32 },
+
+    #[error("byte rate ({bytes_per_second} bytes/s) exceeds the limit of the wav format")]
+    ByteRateTooHigh { bytes_per_second: u64 },
 }
 
 /// Sample format for writing audio
@@ -37,16 +49,6 @@ pub struct WriteConfig {
     pub sample_format: SampleFormat,
 }
 
-/// Scale a normalized sample to an integer range.
-///
-/// Rounds to the nearest integer and clamps to `[-max, max]`, so that full scale
-/// input neither wraps nor drops out when the range is not exactly representable
-/// in the sample type.
-fn to_int<F: Float>(sample: F, max: f64) -> f64 {
-    let sample = sample.to_f64().unwrap_or(0.0).clamp(-1.0, 1.0);
-    (sample * max).round().clamp(-max, max)
-}
-
 /// Write interleaved audio samples to a WAV file
 pub fn write<F: Float>(
     path: impl AsRef<Path>,
@@ -65,51 +67,21 @@ pub fn write<F: Float>(
         });
     }
 
-    let spec = hound::WavSpec {
-        channels: num_channels,
+    // Resolve the byte layout before touching the filesystem, so that input the
+    // wav format cannot describe does not leave a truncated file behind.
+    let layout = wav::Layout::new(
+        samples.len(),
+        num_channels,
         sample_rate,
-        bits_per_sample: match config.sample_format {
-            SampleFormat::Int8 => 8,
-            SampleFormat::Int16 => 16,
-            SampleFormat::Int32 => 32,
-            SampleFormat::Float32 => 32,
-        },
-        sample_format: match config.sample_format {
-            SampleFormat::Int8 | SampleFormat::Int16 | SampleFormat::Int32 => {
-                hound::SampleFormat::Int
-            }
-            SampleFormat::Float32 => hound::SampleFormat::Float,
-        },
-    };
+        config.sample_format,
+    )?;
 
-    let mut writer = hound::WavWriter::create(path.as_ref(), spec)?;
-
-    match config.sample_format {
-        SampleFormat::Int8 => {
-            for &sample in samples {
-                writer.write_sample(to_int(sample, i8::MAX as f64) as i8)?;
-            }
-        }
-        SampleFormat::Int16 => {
-            for &sample in samples {
-                writer.write_sample(to_int(sample, i16::MAX as f64) as i16)?;
-            }
-        }
-        SampleFormat::Int32 => {
-            for &sample in samples {
-                writer.write_sample(to_int(sample, i32::MAX as f64) as i32)?;
-            }
-        }
-        SampleFormat::Float32 => {
-            for &sample in samples {
-                writer.write_sample(sample.to_f32().unwrap_or(0.0))?;
-            }
-        }
-    }
-
-    writer.finalize()?;
-
-    Ok(())
+    // The encoder writes the header in one call and the samples in large
+    // blocks, so there is nothing left for a BufWriter to coalesce. Writing
+    // straight to the file also means every error surfaces here rather than
+    // being discovered while a buffer is flushed on drop.
+    let mut file = File::create(path.as_ref())?;
+    wav::write(&mut file, &layout, samples)
 }
 
 /// Write audio from an AudioBlock to a WAV file
@@ -263,6 +235,170 @@ mod tests {
 
         // Both are rejected before the file is created
         assert!(!std::path::Path::new("tmp_invalid.wav").exists());
+    }
+
+    /// Input the wav format cannot describe is rejected up front too, so no
+    /// half written file is left on disk.
+    #[test]
+    fn test_unrepresentable_input_leaves_no_file() {
+        use super::*;
+
+        let path = "tmp_unrepresentable.wav";
+        match write::<f32>(
+            path,
+            &[],
+            u16::MAX,
+            48000,
+            WriteConfig {
+                sample_format: SampleFormat::Int32,
+            },
+        ) {
+            Err(WriteError::FrameTooLarge { .. }) => (),
+            other => panic!("{other:?}"),
+        }
+
+        assert!(!std::path::Path::new(path).exists());
+    }
+
+    /// The reason this crate encodes wav itself. A mono float file must not be
+    /// tagged `WAVEFORMATEXTENSIBLE`: its `dwChannelMask` can only name a
+    /// physical speaker, and naming `SPEAKER_FRONT_LEFT` makes players route
+    /// the audio to the left speaker alone.
+    #[test]
+    fn test_mono_files_are_not_speaker_assigned() {
+        use super::*;
+
+        let path = "tmp_mono_mask.wav";
+        for sample_format in [
+            SampleFormat::Int8,
+            SampleFormat::Int16,
+            SampleFormat::Int32,
+            SampleFormat::Float32,
+        ] {
+            write(path, &[0.0f32; 8], 1, 48000, WriteConfig { sample_format }).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+
+            // wFormatTag sits at the start of the fmt chunk body.
+            let tag = u16::from_le_bytes(bytes[20..22].try_into().unwrap());
+            assert_ne!(tag, 0xfffe, "{sample_format:?} is extensible");
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Multichannel output takes the extensible path, so check a decoder can
+    /// still read it back.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_round_trip_multichannel() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let audio1 = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
+        assert_eq!(audio1.num_channels, 4);
+
+        let path = "tmp_4ch.wav";
+        for sample_format in [
+            SampleFormat::Int16,
+            SampleFormat::Int32,
+            SampleFormat::Float32,
+        ] {
+            write(
+                path,
+                &audio1.samples_interleaved,
+                audio1.num_channels,
+                audio1.sample_rate,
+                WriteConfig { sample_format },
+            )
+            .unwrap();
+
+            let audio2 = read::<f32>(path, ReadConfig::default()).unwrap();
+            assert_eq!(audio2.num_channels, 4, "{sample_format:?}");
+            assert_eq!(audio1.sample_rate, audio2.sample_rate);
+            approx::assert_abs_diff_eq!(
+                audio1.samples_interleaved.as_slice(),
+                audio2.samples_interleaved.as_slice(),
+                epsilon = 1e-4
+            );
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The odd frame counts that need a pad byte have to survive a round trip,
+    /// since a decoder that trusts the chunk size would otherwise read into it.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_round_trip_odd_length() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = "tmp_odd.wav";
+        for num_frames in 0..6 {
+            let samples: Vec<f32> = (0..num_frames).map(|i| i as f32 / 10.0).collect();
+
+            write(
+                path,
+                &samples,
+                1,
+                48000,
+                WriteConfig {
+                    sample_format: SampleFormat::Int8,
+                },
+            )
+            .unwrap();
+
+            let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+            assert_eq!(
+                audio.samples_interleaved.len(),
+                num_frames,
+                "{num_frames} frames"
+            );
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The public API is generic over the float type, so f64 input has to work
+    /// end to end and not just in the encoder.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_round_trip_f64_input() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = "tmp_f64.wav";
+        let samples: Vec<f64> = (0..64).map(|i| (i as f64 / 32.0) - 1.0).collect();
+
+        write(
+            path,
+            &samples,
+            2,
+            48000,
+            WriteConfig {
+                sample_format: SampleFormat::Float32,
+            },
+        )
+        .unwrap();
+
+        let audio = read::<f64>(path, ReadConfig::default()).unwrap();
+        assert_eq!(audio.num_channels, 2);
+        approx::assert_abs_diff_eq!(
+            samples.as_slice(),
+            audio.samples_interleaved.as_slice(),
+            epsilon = 1e-6
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     /// Full scale samples must not wrap around or drop out, which happens when

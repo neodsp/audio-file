@@ -24,6 +24,9 @@
 - `ReadError`, `WriteError`, and `ResampleError` are now `#[non_exhaustive]`, so
   a `match` over them needs a wildcard arm. In exchange, variants added in later
   releases are no longer breaking changes.
+- `hound` is no longer a dependency. Wav files are encoded by this crate, so
+  `WriteError::Encode(hound::Error)` is gone and I/O failures are reported as
+  `WriteError::Io(std::io::Error)` instead.
 
 ## Improvements
 
@@ -69,9 +72,14 @@
 - The documentation now states that `start` is inclusive and `stop` is
   exclusive, so reading from frame 300 to frame 400 yields 100 frames. This has
   always been the behavior.
-- Dependency housekeeping: the internal `audioadapter-buffers` dependency moved
-  to 4, and `approx` moved to the dev-dependencies. Neither is part of the
-  public API.
+- Wav files are now encoded by this crate rather than by `hound`, which the
+  speaker assignment fixes below needed. Every chunk size is resolved before the
+  first byte is written, so the encoder never seeks back over its own output, and
+  a write error surfaces from `write` instead of being discovered while a buffer
+  is flushed on drop.
+- Dependency housekeeping: `hound` is gone, the internal `audioadapter-buffers`
+  dependency moved to 4, and `approx` moved to the dev-dependencies. None of them
+  is part of the public API.
 
 ## New Error Variants
 
@@ -80,10 +88,31 @@
 - `WriteError`: `ZeroChannels` and `UnalignedSamples`. Writing with zero
   channels or a sample count that is not a multiple of the channel count is now
   rejected before the file is created.
+- `WriteError`: `FileTooLarge`, `FrameTooLarge`, and `ByteRateTooHigh`. Wav
+  describes its sizes in 32-bit and 16-bit fields, which caps a file at 4 GiB, a
+  frame at 65535 bytes, and the byte rate at what `nAvgBytesPerSec` can hold.
+  Output beyond any of those is now rejected before the file is created, instead
+  of being written with wrapped size fields.
 - `ResampleError`: `ZeroChannels`
 
 ## Fixes
 
+- Mono files are no longer assigned to a single physical speaker. Anything wider
+  than 16 bits per sample used to be written as a `WAVEFORMATEXTENSIBLE`, whose
+  `dwChannelMask` named `SPEAKER_FRONT_LEFT` when there was one channel, so a
+  mono `Float32` or `Int32` file played through the left speaker alone on players
+  that honor the mask. Mono and stereo now use `PCMWAVEFORMAT` for integer
+  samples and `WAVEFORMATEX` for float, neither of which carries a mask. That is
+  also what ffmpeg and libsndfile write, and the mono float header this crate
+  produces is now byte for byte identical to ffmpeg's.
+- Multichannel files no longer claim a speaker layout they were never given.
+  `dwChannelMask` used to be filled with one bit per channel, which labels the
+  fourth channel of a quadraphonic file as the subwoofer feed. It is now zero,
+  meaning the channels are not assigned to physical speakers, because the channel
+  count is all this crate is told.
+- A data chunk of an odd length is now followed by the pad byte that RIFF
+  requires, so a file with an odd number of `Int8` samples is word aligned like
+  every other chunk in the format.
 - A `stop` position no longer bypasses resampling when a target sample rate is
   set.
 - Channel selection no longer overflows on out-of-range input. Defaulting the
