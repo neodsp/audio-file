@@ -344,6 +344,9 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     // Offset for re-anchoring within a chained stream, whose packet timestamps
     // restart at zero even though its decoded frames continue the output.
     let mut stream_base = 0u64;
+    // Set while a seek landing still has to be checked against the requested
+    // start, which can only be done once a packet after it has been positioned.
+    let mut unverified_landing = false;
     // Last position that was known exactly before a discarded packet left a hole,
     // and the origin of the grid the next position is snapped to. Only a discarded
     // packet keeps the timeline around the hole intact; a seek or a decoder reset
@@ -488,6 +491,7 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                         decoder.reset();
                         position = None;
                         seeked = true;
+                        unverified_landing = true;
                         // The landing is a discontinuity, so a hole from before it
                         // cannot put the frames after it on a grid.
                         grid_anchor = None;
@@ -547,6 +551,21 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                 None => stream_base,
             },
         };
+
+        // A format reader can report a landing at or before the requested start and
+        // still deliver its first packet after it. The frames in between were never
+        // lost, so they are not filled with silence, and the read would quietly
+        // begin late and come up short. Decoding from the beginning always reaches
+        // the requested start, which is what not seeking would have cost anyway.
+        if std::mem::take(&mut unverified_landing) && packet_start > plan.start_frame as u64 {
+            format = open_format(path)?;
+            (track, decoder) = select_track(&*format, &dec_opts)?;
+            position = Some(0);
+            seeked = false;
+            grid_anchor = None;
+            continue;
+        }
+
         let packet_end = packet_start.saturating_add(packet_frames as u64);
 
         // Intersect the packet with the requested frame range
