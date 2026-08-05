@@ -449,8 +449,12 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
 
                 // Seeking can only be decided here, because the frame positions
                 // it needs are resolved against the sample rate of this packet.
-                // The frames of this packet are given up with the seek, and they
-                // lie before its target anyway.
+                // The frames of this packet are given up, which loses nothing:
+                // decoding resumes at or before the requested start, so anything
+                // this packet carried inside the requested range is decoded
+                // again. It is usually the first packet of the file and lies
+                // entirely before the seek target, but a file whose early
+                // packets all fail to decode resolves the plan later than that.
                 if let Some(tb) = track.time_base
                     && should_seek(
                         resolved.start_frame,
