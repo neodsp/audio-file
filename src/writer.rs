@@ -301,10 +301,14 @@ mod tests {
         assert_eq!(audio1.num_channels, 4);
 
         let path = "tmp_4ch.wav";
-        for sample_format in [
-            SampleFormat::Int16,
-            SampleFormat::Int32,
-            SampleFormat::Float32,
+        // Every sample format, since each pairs the extensible layout with a
+        // different SubFormat GUID and sample width. 8-bit needs the loose
+        // epsilon its precision allows.
+        for (sample_format, epsilon) in [
+            (SampleFormat::Int8, 2e-2),
+            (SampleFormat::Int16, 1e-4),
+            (SampleFormat::Int32, 1e-4),
+            (SampleFormat::Float32, 1e-4),
         ] {
             write(
                 path,
@@ -321,9 +325,106 @@ mod tests {
             approx::assert_abs_diff_eq!(
                 audio1.samples_interleaved.as_slice(),
                 audio2.samples_interleaved.as_slice(),
-                epsilon = 1e-4
+                epsilon = epsilon
             );
         }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The widest file this crate can read back again. The encoder can describe
+    /// far more channels, but the decoder rejects a `WAVEFORMATEXTENSIBLE`
+    /// naming more than 18, so 18 is where a round trip stops working. Writing
+    /// wider files stays supported; only reading them here does not.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_round_trip_eighteen_channels() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = "tmp_18ch.wav";
+        let num_channels = 18u16;
+        let samples: Vec<f32> = (0..usize::from(num_channels) * 5)
+            .map(|i| (i as f32 * 0.01) - 0.5)
+            .collect();
+
+        write(
+            path,
+            &samples,
+            num_channels,
+            48000,
+            WriteConfig {
+                sample_format: SampleFormat::Int32,
+            },
+        )
+        .unwrap();
+
+        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        assert_eq!(audio.num_channels, num_channels);
+        approx::assert_abs_diff_eq!(
+            samples.as_slice(),
+            audio.samples_interleaved.as_slice(),
+            epsilon = 1e-6
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A path that cannot be created has to surface as an error instead of a
+    /// panic, since the encoder writes straight to the file.
+    #[test]
+    fn test_unwritable_path_is_reported() {
+        use super::*;
+
+        match write::<f32>(
+            "tmp_missing_dir/nested/out.wav",
+            &[0.0; 4],
+            1,
+            48000,
+            WriteConfig::default(),
+        ) {
+            Err(WriteError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `write_block` reinterleaves before handing the samples to the encoder, so
+    /// a channel-major block has to come back in the same order it went in.
+    #[cfg(all(
+        feature = "audio-blocks",
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_round_trip_block() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = "tmp_block.wav";
+        // Two channels of three frames, laid out channel after channel.
+        let block = audio_blocks::Sequential::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], 2);
+
+        write_block(
+            path,
+            block,
+            48000,
+            WriteConfig {
+                sample_format: SampleFormat::Float32,
+            },
+        )
+        .unwrap();
+
+        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        assert_eq!(audio.num_channels, 2);
+        assert_eq!(audio.sample_rate, 48000);
+        approx::assert_abs_diff_eq!(
+            [0.1f32, -0.1, 0.2, -0.2, 0.3, -0.3].as_slice(),
+            audio.samples_interleaved.as_slice(),
+            epsilon = 1e-6
+        );
 
         std::fs::remove_file(path).unwrap();
     }

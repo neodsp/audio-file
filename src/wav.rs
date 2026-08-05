@@ -753,6 +753,28 @@ mod tests {
         assert!(written[1].is_sign_negative());
     }
 
+    /// The integer formats fold NaN and out of range input to something
+    /// representable, but float output has nothing to fold them to, so they are
+    /// written verbatim rather than quietly turning into silence.
+    #[test]
+    fn non_finite_floats_pass_through() {
+        let samples = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let written = parse(&samples, 1, 48_000, SampleFormat::Float32).f32_samples();
+
+        assert!(written[0].is_nan());
+        assert_eq!(written[1], f32::INFINITY);
+        assert_eq!(written[2], f32::NEG_INFINITY);
+
+        // The same holds for f64 input, where the conversion to f32 is what
+        // could lose them.
+        let wide = [f64::NAN, 1e300, -1e300];
+        let written = parse(&wide, 1, 48_000, SampleFormat::Float32).f32_samples();
+
+        assert!(written[0].is_nan());
+        assert_eq!(written[1], f32::INFINITY, "beyond f32 range");
+        assert_eq!(written[2], f32::NEG_INFINITY);
+    }
+
     /// Scaling rounds to the nearest integer rather than truncating towards
     /// zero, which would bias the signal.
     #[test]
