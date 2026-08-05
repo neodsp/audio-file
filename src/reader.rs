@@ -344,6 +344,11 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
     // Offset for re-anchoring within a chained stream, whose packet timestamps
     // restart at zero even though its decoded frames continue the output.
     let mut stream_base = 0u64;
+    // Last position that was known exactly before a discarded packet left a hole,
+    // and the origin of the grid the next position is snapped to. Only a discarded
+    // packet keeps the timeline around the hole intact; a seek or a decoder reset
+    // is a real discontinuity, where no grid carries over.
+    let mut grid_anchor: Option<u64> = None;
     // Never copy the same absolute frame twice if timestamp-based recovery after
     // a decode error lands before data that was already returned. Set to the
     // start frame as soon as the plan is resolved.
@@ -374,6 +379,7 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                 // the base if a later error requires re-anchoring from this new
                 // stream's zero-based timestamps.
                 stream_base = position.unwrap_or(stream_base);
+                grid_anchor = None;
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -392,7 +398,10 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Err(Error::DecodeError(_) | Error::IoError(_)) if track.time_base.is_some() => {
                 // The number of frames lost with this packet is unknown. Let the
                 // next non-empty packet establish a new position instead of
-                // shifting all later decoded frames by the missing amount.
+                // shifting all later decoded frames by the missing amount. Keep
+                // the position before the hole as the grid origin, including
+                // across a run of several discarded packets.
+                grid_anchor = position.or(grid_anchor);
                 position = None;
                 continue;
             }
@@ -401,6 +410,9 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Err(Error::ResetRequired) => {
                 decoder.reset();
                 position = None;
+                // The reset is a discontinuity, not a hole in an otherwise intact
+                // timeline.
+                grid_anchor = None;
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -476,6 +488,9 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                         decoder.reset();
                         position = None;
                         seeked = true;
+                        // The landing is a discontinuity, so a hole from before it
+                        // cannot put the frames after it on a grid.
+                        grid_anchor = None;
                     } else {
                         // A failed seek is not guaranteed to leave every format
                         // reader at its original position. Reopening is also the
@@ -485,6 +500,9 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                         format = open_format(path)?;
                         (track, decoder) = select_track(&*format, &dec_opts)?;
                         position = Some(0);
+                        // Everything observed during the abandoned attempt refers
+                        // to positions this read no longer passes through.
+                        grid_anchor = None;
                     }
                     plan = Some(resolved);
                     continue;
@@ -504,12 +522,28 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             Some(position) => position,
             None if packet_frames == 0 => continue,
             None => match track.time_base {
-                Some(tb) => stream_base.saturating_add(timestamp_to_frame(
-                    packet.pts.get(),
-                    packet.trim_start.get(),
-                    tb,
-                    plan.sample_rate,
-                )),
+                Some(tb) => {
+                    let estimate = stream_base.saturating_add(timestamp_to_frame(
+                        packet.pts.get(),
+                        packet.trim_start.get(),
+                        tb,
+                        plan.sample_rate,
+                    ));
+                    // A timestamp coarser than one frame locates this packet only
+                    // to within one tick. If a discarded packet is all that stands
+                    // between it and a position that was known exactly, and the
+                    // codec spaces its packets evenly, the exact position can be
+                    // recovered from that grid instead of from the timestamp.
+                    match grid_anchor {
+                        Some(anchor) => snap_to_grid(
+                            estimate,
+                            anchor,
+                            packet_frames as u64,
+                            frames_per_tick(tb, plan.sample_rate),
+                        ),
+                        None => estimate,
+                    }
+                }
                 None => stream_base,
             },
         };
@@ -659,6 +693,49 @@ fn timestamp_to_frame(ts: i64, trim_start: u64, tb: TimeBase, sample_rate: u32) 
         / i128::from(tb.denom.get())
         + i128::from(trim_start);
     u64::try_from(frames).unwrap_or(if frames < 0 { 0 } else { u64::MAX })
+}
+
+/// Largest number of frames one timestamp tick can span, which bounds how far a
+/// timestamp can be from the frame it refers to.
+fn frames_per_tick(tb: TimeBase, sample_rate: u32) -> u64 {
+    let numer = u128::from(tb.numer.get()) * u128::from(sample_rate);
+    u64::try_from(numer.div_ceil(u128::from(tb.denom.get()))).unwrap_or(u64::MAX)
+}
+
+/// Round a position estimate onto the packet grid that starts at `anchor`.
+///
+/// A timestamp coarser than one frame, such as the milliseconds of a Matroska file
+/// at 44.1 kHz, locates a packet only to within one tick. A codec with a constant
+/// blocksize spaces its packets `block` frames apart, so the true position is a
+/// whole number of blocks after a position that is already known exactly, and the
+/// estimate can be rounded back onto it.
+///
+/// `block` is the frame count of the packet being positioned, which is only the
+/// real spacing if the codec has a constant blocksize and this is not its last,
+/// short packet. `tolerance` is what makes that guess safe: an estimate further
+/// than one timestamp tick from the nearest grid point is returned unchanged,
+/// because timestamp quantization cannot account for the difference. A spacing that
+/// is not the real one is therefore either rejected, or off by less than a tick,
+/// which is what the estimate already was.
+fn snap_to_grid(estimate: u64, anchor: u64, block: u64, tolerance: u64) -> u64 {
+    // Only a position ahead of the anchor can sit on the grid ahead of it.
+    let Some(ahead) = estimate.checked_sub(anchor) else {
+        return estimate;
+    };
+    // At least one packet was lost to get here, so the nearest grid point can
+    // never be the anchor itself.
+    let blocks = ahead
+        .saturating_add(block / 2)
+        .checked_div(block)
+        .unwrap_or(1)
+        .max(1);
+    let snapped = anchor.saturating_add(blocks.saturating_mul(block));
+
+    if snapped.abs_diff(estimate) <= tolerance {
+        snapped
+    } else {
+        estimate
+    }
 }
 
 /// Whether to seek to the requested start instead of decoding up to it.
@@ -1301,6 +1378,46 @@ mod tests {
     }
 
     #[test]
+    fn test_frames_per_tick_bounds_the_timestamp_error() {
+        let tb = |numer, denom| TimeBase::try_new(numer, denom).unwrap();
+
+        // A millisecond tick spans 44.1 frames at 44.1 kHz, so a timestamp can be
+        // up to 45 frames away from the frame it refers to
+        assert_eq!(frames_per_tick(tb(1, 1000), 44_100), 45);
+        // The same tick is exact at 48 kHz
+        assert_eq!(frames_per_tick(tb(1, 1000), 48_000), 48);
+        // A time base of one tick per frame cannot be off at all
+        assert_eq!(frames_per_tick(tb(1, 44_100), 44_100), 1);
+    }
+
+    #[test]
+    fn test_snap_to_grid_recovers_a_quantized_position() {
+        // One FLAC block after the anchor, as a millisecond timestamp at 44.1 kHz
+        // reports it: 22 frames early
+        assert_eq!(snap_to_grid(4586, 0, 4608, 45), 4608);
+        // Several blocks after a non-zero anchor, quantized late
+        assert_eq!(
+            snap_to_grid(10_000 + 3 * 4608 + 30, 10_000, 4608, 45),
+            23_824
+        );
+        // An exact position is already on the grid and stays put
+        assert_eq!(snap_to_grid(9216, 0, 4608, 1), 9216);
+
+        // At least one packet was lost, so the anchor itself is never the answer
+        assert_eq!(snap_to_grid(20, 0, 4608, 4608), 4608);
+
+        // An estimate too far off any grid point is left alone: something other
+        // than timestamp quantization moved it, and rounding would introduce an
+        // error of up to half a block instead of removing one of a few frames
+        assert_eq!(snap_to_grid(7000, 0, 4608, 45), 7000);
+        // The same estimate against a spacing it does fit
+        assert_eq!(snap_to_grid(7000, 0, 3500, 45), 7000);
+
+        // An estimate before the anchor is not on the grid ahead of it
+        assert_eq!(snap_to_grid(500, 1000, 4608, 45), 500);
+    }
+
+    #[test]
     fn test_expected_frames_is_bounded_by_the_file_length() {
         let bounded = Plan::resolve(
             48_000,
@@ -1581,14 +1698,23 @@ mod tests {
     ))]
     #[test]
     fn test_discarded_packet_keeps_later_frames_aligned() {
-        // 48 kHz, so that the millisecond timestamp the position is recovered
-        // from is an exact frame boundary. At 44.1 kHz the recovered position is
-        // off by up to half a millisecond, which the fill cannot make up for.
-        const PATH: &str = "test_data/test_flac_48k.mka";
-        let intact = read::<f32>(PATH, ReadConfig::default())
+        // At 48 kHz a millisecond timestamp is an exact frame boundary, so the
+        // position after the hole comes straight from the timestamp. At 44.1 kHz it
+        // is not, and the exact position is only recoverable from the grid that the
+        // constant FLAC blocksize puts the packets on.
+        assert_discarded_packet_leaves_one_silent_hole("test_data/test_flac_48k.mka");
+        assert_discarded_packet_leaves_one_silent_hole("test_data/test_flac.mka");
+    }
+
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "mkv"),
+        any(feature = "all-codecs", feature = "flac")
+    ))]
+    fn assert_discarded_packet_leaves_one_silent_hole(source_path: &str) {
+        let intact = read::<f32>(source_path, ReadConfig::default())
             .unwrap()
             .samples_interleaved;
-        let source = std::fs::read(PATH).unwrap();
+        let source = std::fs::read(source_path).unwrap();
 
         // A FLAC frame header is protected by a CRC-8, so flipping a bit in it
         // makes the decoder reject that one packet while all the others stay
@@ -1626,17 +1752,18 @@ mod tests {
             let (gap_start, gap_end) = hole.expect("the hole must be silent");
             assert!(
                 gap_end - gap_start < intact.len() / 4,
-                "more than one packet was discarded: {gap_start}..{gap_end}"
+                "{source_path}: more than one packet was discarded: {gap_start}..{gap_end}"
             );
-            // Everything around the hole is still at its own position
-            assert_eq!(damaged[..gap_start], intact[..gap_start]);
-            assert_eq!(damaged[gap_end..], intact[gap_end..]);
+            // Everything around the hole is still at its own position, frame for
+            // frame, which only holds if the recovered position was exact.
+            assert_eq!(damaged[..gap_start], intact[..gap_start], "{source_path}");
+            assert_eq!(damaged[gap_end..], intact[gap_end..], "{source_path}");
 
             std::fs::remove_file(&path).unwrap();
             return;
         }
 
-        panic!("no corrupted frame header made the decoder discard a packet");
+        panic!("{source_path}: no corrupted frame header made the decoder discard a packet");
     }
 
     /// The range `a` and `b` disagree over, if `a` is silent across all of it.
