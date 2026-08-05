@@ -104,6 +104,25 @@
 //! - `audio-blocks` enables `read_block` and `write_block`.
 //! - Individual codec flags (above) enable specific formats.
 //!
+//! ## Known Limitations
+//!
+//! Reading is delegated to Symphonia, which maps channels to named speaker positions instead of
+//! treating them as a plain count. Several containers therefore have a read-back channel ceiling
+//! well below what the format itself allows:
+//!
+//! - **WAV** files with an extensible `fmt` chunk are rejected above 18 channels, files with a
+//!   plain `fmt` chunk above 26.
+//! - **CAF** files with high channel counts are unreliable: a 24-channel file is silently
+//!   decoded as 18 channels with misaligned samples, and 32 channels is rejected.
+//! - **Matroska** has no such ceiling, since channels are treated as discrete. 24 and 32
+//!   channel files read back correctly.
+//! - **FLAC** is limited to 8 channels by the format itself, so it is no alternative for high
+//!   channel counts.
+//!
+//! This crate writes the extensible WAV layout above two channels, so its own files with 19 or
+//! more channels cannot be read back by this crate. The files are valid, and other readers such
+//! as ffmpeg and libsndfile accept them. For high channel counts, prefer Matroska. A future
+//! version may read PCM wav without Symphonia to lift the wav ceilings.
 //!
 //! ## Read and Write Options
 //!

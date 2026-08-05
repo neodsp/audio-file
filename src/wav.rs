@@ -14,6 +14,15 @@
 //! ffmpeg and libsndfile write. Above two channels the layout is unavoidable,
 //! and there the mask says the channels are unassigned rather than guessing at
 //! speakers the caller never named.
+//!
+//! The read-back side of that choice is worth knowing. Symphonia, which this
+//! crate reads with, derives the channel layout from the mask and only knows
+//! the 18 standard speaker positions, so it rejects extensible files above 18
+//! channels while reading plain ones up to 26. The files written here are
+//! valid and other readers accept them, but from 19 channels up this crate
+//! cannot read its own output back. Writing the plain layout above 18
+//! channels instead would raise the read-back ceiling to 26, at the cost of
+//! ignoring Microsoft's "extensible above two channels" guidance.
 
 use std::io::{self, Write};
 
