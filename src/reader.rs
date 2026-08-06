@@ -267,6 +267,9 @@ impl Plan {
         }
 
         let (start, count) = channel_range(config, channels)?;
+        // `Audio` reports the channel count as a `u16`, so a selection it cannot
+        // describe is rejected here instead of after the whole file is decoded.
+        checked_num_channels(count)?;
 
         Ok(Self {
             sample_rate,
@@ -278,6 +281,14 @@ impl Plan {
             start_frame,
             end_frame,
         })
+    }
+
+    /// Number of frames the caller asked for, if the read is bounded by a stop
+    /// position. Unlike [`Self::expected_frames`] this does not consult the
+    /// container, so it is a bound the caller set and not one a file can claim.
+    fn requested_frames(&self) -> Option<usize> {
+        self.end_frame
+            .map(|end| end.saturating_sub(self.start_frame))
     }
 
     /// Number of frames the read is expected to yield, if the file length is
@@ -333,7 +344,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
 
     // Resolved from the first packet that decodes, see `Plan`.
     let mut plan: Option<Plan> = None;
-    let mut seeked = false;
 
     // Absolute frame index of the next decoded frame. Decoding from the beginning
     // has an exact zero anchor. After a successful seek (or a discontinuity), one
@@ -490,7 +500,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
                         // beginning of the file.
                         decoder.reset();
                         position = None;
-                        seeked = true;
                         unverified_landing = true;
                         // The landing is a discontinuity, so a hole from before it
                         // cannot put the frames after it on a grid.
@@ -561,7 +570,6 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             format = open_format(path)?;
             (track, decoder) = select_track(&*format, &dec_opts)?;
             position = Some(0);
-            seeked = false;
             grid_anchor = None;
             continue;
         }
@@ -581,16 +589,16 @@ fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, Read
             // output, instead of shifting the whole remainder of the read earlier
             // by the number of missing frames.
             //
-            // A hole before the first copied frame is only filled when the read
-            // was not seeked. After a seek the first packet may simply start
-            // later than requested, and its frames were never lost, so silence
-            // would be presented as audio that the file does have.
-            if copy_start > copied_until && (!seeked || copied_until > plan.start_frame as u64) {
+            // Every hole here is a genuine loss, so it is always filled. A seek
+            // landing that starts late was already caught by the landing check
+            // above, which reopens the file instead of presenting silence as
+            // audio the file never lost.
+            if copy_start > copied_until {
                 let missing = fill_frames(
                     copy_start - copied_until,
                     samples.len() / layout.count,
                     layout.count,
-                    plan.expected_frames(track.num_frames),
+                    plan.requested_frames(),
                 );
                 let len = samples
                     .len()
@@ -693,15 +701,24 @@ fn position_to_frame(position: Position, sample_rate: u32) -> Option<usize> {
 /// Number of silent frames to insert for a hole of `missing` frames, after
 /// `written` frames have been produced.
 ///
-/// A corrupt timestamp could ask for an enormous hole, so the fill is capped by
-/// the frames the read can produce at all, and by the same budget as the
-/// preallocation when neither the stop position nor the file length bounds it. A
-/// capped fill leaves the output short, which a truncated file does as well.
-fn fill_frames(missing: u64, written: usize, channels: usize, max_frames: Option<usize>) -> usize {
+/// A corrupt timestamp could ask for an enormous hole, so the fill is bounded by
+/// `requested_frames`, the length the caller asked for, and in any case by the
+/// same budget as the preallocation, since a `stop` of `usize::MAX` is a bound in
+/// name only. The container's frame count is not consulted: it is no more
+/// trustworthy than the timestamp, and understating it, which containers do,
+/// would truncate a fill the read could have completed. A truncated fill shifts
+/// every frame after it earlier, which only holes beyond the budget pay.
+fn fill_frames(
+    missing: u64,
+    written: usize,
+    channels: usize,
+    requested_frames: Option<usize>,
+) -> usize {
     let missing = usize::try_from(missing).unwrap_or(usize::MAX);
-    let limit = match max_frames {
-        Some(max) => max.saturating_sub(written),
-        None => MAX_PREALLOC_SAMPLES / channels.max(1),
+    let budget = MAX_PREALLOC_SAMPLES / channels.max(1);
+    let limit = match requested_frames {
+        Some(requested) => requested.saturating_sub(written).min(budget),
+        None => budget,
     };
     missing.min(limit)
 }
@@ -1303,6 +1320,17 @@ mod tests {
         assert!(should_seek(100_000, 48_000, ms, "wav"));
     }
 
+    /// `should_seek` recognizes Matroska by the `short_name` symphonia reports,
+    /// which a symphonia update could rename. A rename would only cost the seek
+    /// skip, since the landing validation reopens the file anyway, so this is a
+    /// canary, not a guard against a bug.
+    #[cfg(any(feature = "all-codecs", feature = "mkv"))]
+    #[test]
+    fn test_matroska_is_still_named_matroska() {
+        let format = open_format(Path::new("test_data/test_flac.mka")).unwrap();
+        assert_eq!(format.format_info().short_name, "matroska");
+    }
+
     #[test]
     fn test_channel_count_must_fit_the_reported_type() {
         assert_eq!(checked_num_channels(2).unwrap(), 2);
@@ -1318,6 +1346,24 @@ mod tests {
             "{error:?}"
         );
         assert!(!error.to_string().is_empty());
+
+        // The same limit is enforced when the read plan is resolved, before any
+        // decoding happens
+        assert!(matches!(
+            Plan::resolve(48_000, 65_536, &ReadConfig::default()),
+            Err(ReadError::TooManyChannels(65_536))
+        ));
+        // ... while selecting fewer channels than the file has stays allowed
+        let plan = Plan::resolve(
+            48_000,
+            65_536,
+            &ReadConfig {
+                num_channels: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.layout.count, 2);
     }
 
     #[test]
@@ -1491,15 +1537,55 @@ mod tests {
 
     #[test]
     fn test_gap_fill_is_bounded() {
-        // A hole inside a known length is filled completely
+        // A hole inside the requested range is filled completely
         assert_eq!(fill_frames(100, 900, 2, Some(2_000)), 100);
-        // ... but never beyond the frames the read can still produce
+        // ... but never beyond the frames the read was asked for
         assert_eq!(fill_frames(100, 1_950, 2, Some(2_000)), 50);
         assert_eq!(fill_frames(100, 2_000, 2, Some(2_000)), 0);
-        // Without a known length, a bogus timestamp is capped by the same budget
+        // Without a stop position, a bogus timestamp is capped by the same budget
         // as the preallocation
         assert_eq!(fill_frames(100, 0, 2, None), 100);
         assert_eq!(fill_frames(u64::MAX, 0, 2, None), MAX_PREALLOC_SAMPLES / 2);
+        // The budget counts samples, so more channels leave room for fewer frames
+        assert_eq!(
+            fill_frames(u64::MAX, 0, 32, None),
+            MAX_PREALLOC_SAMPLES / 32
+        );
+        // A stop position wide enough to be no bound at all does not lift the
+        // budget either, so the fill can never be sized from a bogus timestamp
+        // alone
+        assert_eq!(
+            fill_frames(u64::MAX, 0, 2, Some(usize::MAX)),
+            MAX_PREALLOC_SAMPLES / 2
+        );
+    }
+
+    /// The frames the caller asked for, which bound a hole fill, are a property
+    /// of the config alone: a container claiming a different length cannot widen
+    /// or narrow them.
+    #[test]
+    fn test_requested_frames_ignores_the_container() {
+        let plan = |config| Plan::resolve(48_000, 2, &config).unwrap();
+
+        assert_eq!(plan(ReadConfig::default()).requested_frames(), None);
+        assert_eq!(
+            plan(ReadConfig {
+                start: Position::Frame(100),
+                stop: Position::Frame(1_100),
+                ..Default::default()
+            })
+            .requested_frames(),
+            Some(1_000)
+        );
+
+        // Where the container is consulted, for the preallocation, it does bound
+        // the estimate
+        let bounded = plan(ReadConfig {
+            stop: Position::Frame(1_000),
+            ..Default::default()
+        });
+        assert_eq!(bounded.expected_frames(Some(400)), Some(400));
+        assert_eq!(bounded.requested_frames(), Some(1_000));
     }
 
     #[test]
@@ -1744,7 +1830,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!syncs.is_empty(), "fixture: no FLAC frame sync word found");
 
-        let path = std::env::temp_dir().join("audio-file-discarded-packet.mka");
+        let path = crate::tmp_path("discarded-packet.mka");
         for sync in syncs {
             let mut damaged_source = source.clone();
             damaged_source[sync + 3] ^= 0x0F;
@@ -1945,7 +2031,7 @@ mod tests {
     ))]
     #[test]
     fn test_start_beyond_seek_threshold() {
-        let path = "tmp_read_seek.wav";
+        let path = crate::tmp_path("read-seek.wav");
 
         // Three seconds of a ramp, so that every frame is identifiable
         let num_frames = 48000 * 3;
@@ -1956,7 +2042,7 @@ mod tests {
             samples.push(-value);
         }
         crate::writer::write(
-            path,
+            &path,
             &samples,
             2,
             48000,
@@ -1968,7 +2054,7 @@ mod tests {
 
         for start in [48_001, 60_000, 100_000, 143_000] {
             let audio = read::<f32>(
-                path,
+                &path,
                 ReadConfig {
                     start: Position::Frame(start),
                     ..Default::default()
@@ -1989,7 +2075,129 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// What `read` documents about positions the file does not reach: a start
+    /// beyond the end yields no samples, and a stop beyond the end clips to the
+    /// frames that are there. Starts on both sides of the seek threshold are
+    /// covered, because an unreachable start is what makes a seek fail.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_positions_beyond_the_end_of_the_file() {
+        let path = crate::tmp_path("read-beyond-eof.wav");
+
+        // Half a second, so that a start beyond the end can still be below the
+        // one second seek threshold
+        let num_frames = 24_000;
+        let samples: Vec<f32> = (0..num_frames * 2).map(|i| i as f32 / 1e6).collect();
+        crate::writer::write(
+            &path,
+            &samples,
+            2,
+            48000,
+            crate::writer::WriteConfig {
+                sample_format: crate::writer::SampleFormat::Float32,
+            },
+        )
+        .unwrap();
+
+        // One start per path to the same empty result: below the seek threshold
+        // nothing is seeked, at 48_001 the seek aims one second earlier and lands
+        // at the beginning of the file, and beyond the file the seek target
+        // itself is out of range, so the read falls back to decoding.
+        for start in [30_000, 48_001, 1_000_000] {
+            let audio = read::<f32>(
+                &path,
+                ReadConfig {
+                    start: Position::Frame(start),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(audio.num_channels, 2, "start frame {start}");
+            assert_eq!(audio.sample_rate, 48000, "start frame {start}");
+            assert!(
+                audio.samples_interleaved.is_empty(),
+                "start frame {start} returned {} samples",
+                audio.samples_interleaved.len()
+            );
+        }
+
+        // Nothing to resample, but the requested rate is still what the empty
+        // audio is labelled with
+        let audio = read::<f32>(
+            &path,
+            ReadConfig {
+                start: Position::Frame(1_000_000),
+                sample_rate: Some(24_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(audio.sample_rate, 24_000);
+        assert!(audio.samples_interleaved.is_empty());
+
+        let audio = read::<f32>(
+            &path,
+            ReadConfig {
+                stop: Position::Frame(1_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(audio.samples_interleaved, samples);
+
+        let audio = read::<f32>(
+            &path,
+            ReadConfig {
+                stop: Position::Time(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(audio.samples_interleaved, samples);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A time position that does not land on a frame boundary is rounded to the
+    /// nearest frame instead of truncated, so that a position derived from a
+    /// frame index does not move a frame earlier.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_sub_frame_time_positions_are_rounded() {
+        // 1000.4 frames at 48 kHz
+        let start = Duration::from_nanos(20_841_666);
+        // 1200.5 frames, which truncation would place at 1200
+        let stop = Duration::from_nanos(25_010_417);
+
+        let audio = read::<f32>(
+            "test_data/test_1ch.wav",
+            ReadConfig {
+                start: Position::Time(start),
+                stop: Position::Time(stop),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let full = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
+        assert_eq!(audio.samples_interleaved.len(), 201);
+        assert_eq!(
+            audio.samples_interleaved,
+            full.samples_interleaved[1000..1201]
+        );
+
+        assert_eq!(position_to_frame(Position::Time(start), 48_000), Some(1000));
+        assert_eq!(position_to_frame(Position::Time(stop), 48_000), Some(1201));
     }
 
     /// `read_block` is the same read, wrapped in an interleaved audio block.
@@ -2025,18 +2233,18 @@ mod tests {
     ))]
     #[test]
     fn test_read_file_without_frames() {
-        let path = "tmp_read_empty.wav";
-        crate::writer::write::<f32>(path, &[], 2, 48000, crate::writer::WriteConfig::default())
+        let path = crate::tmp_path("read-empty.wav");
+        crate::writer::write::<f32>(&path, &[], 2, 48000, crate::writer::WriteConfig::default())
             .unwrap();
 
-        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio.num_channels, 2);
         assert_eq!(audio.sample_rate, 48000);
         assert!(audio.samples_interleaved.is_empty());
 
         // Resampling nothing must not fail
         let audio = read::<f32>(
-            path,
+            &path,
             ReadConfig {
                 sample_rate: Some(24000),
                 ..Default::default()
@@ -2049,7 +2257,7 @@ mod tests {
 
         // An invalid selection must be rejected even without any audio frames
         match read::<f32>(
-            path,
+            &path,
             ReadConfig {
                 num_channels: Some(99),
                 ..Default::default()
@@ -2059,6 +2267,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 }

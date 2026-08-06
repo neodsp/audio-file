@@ -80,8 +80,25 @@ pub fn write<F: Float>(
     // blocks, so there is nothing left for a BufWriter to coalesce. Writing
     // straight to the file also means every error surfaces here rather than
     // being discovered while a buffer is flushed on drop.
-    let mut file = File::create(path.as_ref())?;
-    wav::write(&mut file, &layout, samples)
+    let path = path.as_ref();
+    let mut file = File::create(path)?;
+    let result = wav::write(&mut file, &layout, samples);
+    // Close the file before the cleanup below, since Windows cannot remove a
+    // path that is still open.
+    drop(file);
+
+    if let Err(err) = result {
+        // A write that failed halfway leaves a truncated file behind, which must
+        // not be mistaken for a finished one. Only a regular file is removed:
+        // the path may be a device or a pipe that was not created here and has
+        // to survive the failed write.
+        if std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 /// Write audio from an AudioBlock to a WAV file
@@ -116,8 +133,9 @@ mod tests {
 
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
 
+        let path = crate::tmp_path("round-trip-i8.wav");
         write(
-            "tmp0.wav",
+            &path,
             &audio1.samples_interleaved,
             audio1.num_channels,
             audio1.sample_rate,
@@ -127,7 +145,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio2 = read::<f32>("tmp0.wav", ReadConfig::default()).unwrap();
+        let audio2 = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio1.sample_rate, audio2.sample_rate);
         // 8-bit PCM has low precision. Symphonia normalizes by dividing by 128
         // (not 127), so max representable value is 127/128 ≈ 0.992, giving a
@@ -139,7 +157,7 @@ mod tests {
         );
 
         // Clean up temporary file
-        std::fs::remove_file("tmp0.wav").expect("Failed to remove temporary test file");
+        std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 
     #[cfg(all(
@@ -153,8 +171,9 @@ mod tests {
 
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
 
+        let path = crate::tmp_path("round-trip-i16.wav");
         write(
-            "tmp1.wav",
+            &path,
             &audio1.samples_interleaved,
             audio1.num_channels,
             audio1.sample_rate,
@@ -164,7 +183,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio2 = read::<f32>("tmp1.wav", ReadConfig::default()).unwrap();
+        let audio2 = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio1.sample_rate, audio2.sample_rate);
         approx::assert_abs_diff_eq!(
             audio1.samples_interleaved.as_slice(),
@@ -173,7 +192,7 @@ mod tests {
         );
 
         // Clean up temporary file
-        std::fs::remove_file("tmp1.wav").expect("Failed to remove temporary test file");
+        std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 
     #[cfg(all(
@@ -187,8 +206,9 @@ mod tests {
 
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
 
+        let path = crate::tmp_path("round-trip-i32.wav");
         write(
-            "tmp3.wav",
+            &path,
             &audio1.samples_interleaved,
             audio1.num_channels,
             audio1.sample_rate,
@@ -198,7 +218,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio2 = read::<f32>("tmp3.wav", ReadConfig::default()).unwrap();
+        let audio2 = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio1.sample_rate, audio2.sample_rate);
         approx::assert_abs_diff_eq!(
             audio1.samples_interleaved.as_slice(),
@@ -207,25 +227,20 @@ mod tests {
         );
 
         // Clean up temporary file
-        std::fs::remove_file("tmp3.wav").expect("Failed to remove temporary test file");
+        std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 
     #[test]
     fn test_invalid_input_is_rejected() {
         use super::*;
 
-        match write::<f32>("tmp_invalid.wav", &[0.0], 0, 48000, WriteConfig::default()) {
+        let path = crate::tmp_path("invalid.wav");
+        match write::<f32>(&path, &[0.0], 0, 48000, WriteConfig::default()) {
             Err(WriteError::ZeroChannels) => (),
             other => panic!("{other:?}"),
         }
 
-        match write::<f32>(
-            "tmp_invalid.wav",
-            &[0.0, 0.0, 0.0],
-            2,
-            48000,
-            WriteConfig::default(),
-        ) {
+        match write::<f32>(&path, &[0.0, 0.0, 0.0], 2, 48000, WriteConfig::default()) {
             Err(WriteError::UnalignedSamples {
                 samples: 3,
                 channels: 2,
@@ -234,7 +249,7 @@ mod tests {
         }
 
         // Both are rejected before the file is created
-        assert!(!std::path::Path::new("tmp_invalid.wav").exists());
+        assert!(!path.exists());
     }
 
     /// Input the wav format cannot describe is rejected up front too, so no
@@ -243,9 +258,9 @@ mod tests {
     fn test_unrepresentable_input_leaves_no_file() {
         use super::*;
 
-        let path = "tmp_unrepresentable.wav";
+        let path = crate::tmp_path("unrepresentable.wav");
         match write::<f32>(
-            path,
+            &path,
             &[],
             u16::MAX,
             48000,
@@ -257,7 +272,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        assert!(!std::path::Path::new(path).exists());
+        assert!(!path.exists());
     }
 
     /// The reason this crate encodes wav itself. A mono float file must not be
@@ -268,22 +283,22 @@ mod tests {
     fn test_mono_files_are_not_speaker_assigned() {
         use super::*;
 
-        let path = "tmp_mono_mask.wav";
+        let path = crate::tmp_path("mono-mask.wav");
         for sample_format in [
             SampleFormat::Int8,
             SampleFormat::Int16,
             SampleFormat::Int32,
             SampleFormat::Float32,
         ] {
-            write(path, &[0.0f32; 8], 1, 48000, WriteConfig { sample_format }).unwrap();
-            let bytes = std::fs::read(path).unwrap();
+            write(&path, &[0.0f32; 8], 1, 48000, WriteConfig { sample_format }).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
 
             // wFormatTag sits at the start of the fmt chunk body.
             let tag = u16::from_le_bytes(bytes[20..22].try_into().unwrap());
             assert_ne!(tag, 0xfffe, "{sample_format:?} is extensible");
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Multichannel output takes the extensible path, so check a decoder can
@@ -300,7 +315,7 @@ mod tests {
         let audio1 = read::<f32>("test_data/test_4ch.wav", ReadConfig::default()).unwrap();
         assert_eq!(audio1.num_channels, 4);
 
-        let path = "tmp_4ch.wav";
+        let path = crate::tmp_path("round-trip-4ch.wav");
         // Every sample format, since each pairs the extensible layout with a
         // different SubFormat GUID and sample width. 8-bit needs the loose
         // epsilon its precision allows.
@@ -311,7 +326,7 @@ mod tests {
             (SampleFormat::Float32, 1e-4),
         ] {
             write(
-                path,
+                &path,
                 &audio1.samples_interleaved,
                 audio1.num_channels,
                 audio1.sample_rate,
@@ -319,7 +334,7 @@ mod tests {
             )
             .unwrap();
 
-            let audio2 = read::<f32>(path, ReadConfig::default()).unwrap();
+            let audio2 = read::<f32>(&path, ReadConfig::default()).unwrap();
             assert_eq!(audio2.num_channels, 4, "{sample_format:?}");
             assert_eq!(audio1.sample_rate, audio2.sample_rate);
             approx::assert_abs_diff_eq!(
@@ -329,7 +344,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The widest file this crate can read back again. The encoder can describe
@@ -345,14 +360,14 @@ mod tests {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = "tmp_18ch.wav";
+        let path = crate::tmp_path("round-trip-18ch.wav");
         let num_channels = 18u16;
         let samples: Vec<f32> = (0..usize::from(num_channels) * 5)
             .map(|i| (i as f32 * 0.01) - 0.5)
             .collect();
 
         write(
-            path,
+            &path,
             &samples,
             num_channels,
             48000,
@@ -362,7 +377,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio.num_channels, num_channels);
         approx::assert_abs_diff_eq!(
             samples.as_slice(),
@@ -370,7 +385,45 @@ mod tests {
             epsilon = 1e-6
         );
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The other side of that ceiling: one channel more and the file this crate
+    /// just wrote is rejected by its own reader, because the extensible layout
+    /// can only name 18 speaker positions. If a future decoder learns to read
+    /// it, this fails and the documented limitation gets updated.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_nineteen_channels_cannot_be_read_back() {
+        use super::*;
+        use crate::reader::{ReadConfig, read};
+
+        let path = crate::tmp_path("19ch.wav");
+        let num_channels = 19u16;
+        let samples = vec![0.0f32; usize::from(num_channels) * 5];
+
+        write(
+            &path,
+            &samples,
+            num_channels,
+            48000,
+            WriteConfig {
+                sample_format: SampleFormat::Int32,
+            },
+        )
+        .unwrap();
+
+        // The decoder rejects it, so it is a symphonia error rather than a
+        // validation error of this crate
+        match read::<f32>(&path, ReadConfig::default()) {
+            Err(crate::reader::ReadError::Decode(_)) => (),
+            other => panic!("{other:?}"),
+        }
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A path that cannot be created has to surface as an error instead of a
@@ -380,7 +433,7 @@ mod tests {
         use super::*;
 
         match write::<f32>(
-            "tmp_missing_dir/nested/out.wav",
+            crate::tmp_path("missing-dir").join("nested/out.wav"),
             &[0.0; 4],
             1,
             48000,
@@ -389,6 +442,26 @@ mod tests {
             Err(WriteError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A write that fails halfway, here because the device is full, has to
+    /// surface the error. `/dev/full` also covers the other half of the cleanup
+    /// that follows such a failure: it removes a file it truncated, but not a
+    /// path it did not create.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_failed_write_is_reported() {
+        use super::*;
+
+        match write::<f32>("/dev/full", &[0.0; 1024], 2, 48000, WriteConfig::default()) {
+            Err(WriteError::Io(_)) => (),
+            other => panic!("{other:?}"),
+        }
+
+        assert!(
+            std::path::Path::new("/dev/full").exists(),
+            "the failed write removed the device"
+        );
     }
 
     /// `write_block` reinterleaves before handing the samples to the encoder, so
@@ -403,12 +476,12 @@ mod tests {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = "tmp_block.wav";
+        let path = crate::tmp_path("round-trip-block.wav");
         // Two channels of three frames, laid out channel after channel.
         let block = audio_blocks::Sequential::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], 2);
 
         write_block(
-            path,
+            &path,
             block,
             48000,
             WriteConfig {
@@ -417,7 +490,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+        let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio.num_channels, 2);
         assert_eq!(audio.sample_rate, 48000);
         approx::assert_abs_diff_eq!(
@@ -426,7 +499,7 @@ mod tests {
             epsilon = 1e-6
         );
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The odd frame counts that need a pad byte have to survive a round trip,
@@ -440,12 +513,12 @@ mod tests {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = "tmp_odd.wav";
+        let path = crate::tmp_path("round-trip-odd.wav");
         for num_frames in 0..6 {
             let samples: Vec<f32> = (0..num_frames).map(|i| i as f32 / 10.0).collect();
 
             write(
-                path,
+                &path,
                 &samples,
                 1,
                 48000,
@@ -455,7 +528,7 @@ mod tests {
             )
             .unwrap();
 
-            let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+            let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
             assert_eq!(
                 audio.samples_interleaved.len(),
                 num_frames,
@@ -463,7 +536,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The public API is generic over the float type, so f64 input has to work
@@ -477,11 +550,11 @@ mod tests {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = "tmp_f64.wav";
+        let path = crate::tmp_path("round-trip-f64.wav");
         let samples: Vec<f64> = (0..64).map(|i| (i as f64 / 32.0) - 1.0).collect();
 
         write(
-            path,
+            &path,
             &samples,
             2,
             48000,
@@ -491,7 +564,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio = read::<f64>(path, ReadConfig::default()).unwrap();
+        let audio = read::<f64>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio.num_channels, 2);
         approx::assert_abs_diff_eq!(
             samples.as_slice(),
@@ -499,7 +572,7 @@ mod tests {
             epsilon = 1e-6
         );
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Full scale samples must not wrap around or drop out, which happens when
@@ -513,7 +586,7 @@ mod tests {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = "tmp_full_scale.wav";
+        let path = crate::tmp_path("full-scale.wav");
         let samples = [1.0f32, -1.0, 0.5, -0.5, 0.0];
 
         for sample_format in [
@@ -522,8 +595,8 @@ mod tests {
             SampleFormat::Int32,
             SampleFormat::Float32,
         ] {
-            write(path, &samples, 1, 48000, WriteConfig { sample_format }).unwrap();
-            let audio = read::<f32>(path, ReadConfig::default()).unwrap();
+            write(&path, &samples, 1, 48000, WriteConfig { sample_format }).unwrap();
+            let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
 
             approx::assert_abs_diff_eq!(
                 samples.as_slice(),
@@ -532,7 +605,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[cfg(all(
@@ -546,8 +619,9 @@ mod tests {
 
         let audio1 = read::<f32>("test_data/test_1ch.wav", ReadConfig::default()).unwrap();
 
+        let path = crate::tmp_path("round-trip-f32.wav");
         write(
-            "tmp2.wav",
+            &path,
             &audio1.samples_interleaved,
             audio1.num_channels,
             audio1.sample_rate,
@@ -557,7 +631,7 @@ mod tests {
         )
         .unwrap();
 
-        let audio2 = read::<f32>("tmp2.wav", ReadConfig::default()).unwrap();
+        let audio2 = read::<f32>(&path, ReadConfig::default()).unwrap();
         assert_eq!(audio1.sample_rate, audio2.sample_rate);
         approx::assert_abs_diff_eq!(
             audio1.samples_interleaved.as_slice(),
@@ -566,6 +640,6 @@ mod tests {
         );
 
         // Clean up temporary file
-        std::fs::remove_file("tmp2.wav").expect("Failed to remove temporary test file");
+        std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 }

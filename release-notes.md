@@ -127,3 +127,6 @@
 - The `InvalidFrameRange` error message now correctly states that the start
   frame must not exceed the end frame.
 - Resampling an empty selection no longer fails.
+- A write that fails halfway, for example because the device is full, now removes
+  the truncated file instead of leaving it behind to be mistaken for a finished
+  one.

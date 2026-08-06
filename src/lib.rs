@@ -270,3 +270,10 @@ pub mod reader;
 mod resample;
 mod wav;
 pub mod writer;
+
+/// A unique temporary path for a test file, so that concurrent test runs and
+/// leftovers from a panicked run cannot interfere with each other.
+#[cfg(test)]
+pub(crate) fn tmp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("audio-file-{}-{name}", std::process::id()))
+}
