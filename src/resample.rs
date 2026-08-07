@@ -1,5 +1,5 @@
 use audioadapter_buffers::direct::InterleavedSlice;
-use num::Float;
+use num_traits::Float;
 use rubato::Fft;
 use rubato::Resampler as _;
 use thiserror::Error;

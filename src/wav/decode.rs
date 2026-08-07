@@ -29,7 +29,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use num::Float;
+use num_traits::Float;
 
 use super::{
     SUBFORMAT_IEEE_FLOAT, SUBFORMAT_PCM, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,

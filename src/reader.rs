@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use num::Float;
+use num_traits::Float;
 use symphonia::core::audio::Channels;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
@@ -894,7 +894,7 @@ fn frames_to_ts(frame: u64, tb: TimeBase, sample_rate: u32) -> u64 {
 }
 
 #[cfg(feature = "audio-blocks")]
-pub fn read_block<F: num::Float + 'static + rubato::Sample>(
+pub fn read_block<F: num_traits::Float + 'static + rubato::Sample>(
     path: impl AsRef<Path>,
     config: ReadConfig,
 ) -> Result<(audio_blocks::Interleaved<F>, u32), ReadError> {
@@ -925,7 +925,7 @@ mod tests {
         any(feature = "all-codecs", feature = "wav"),
         any(feature = "all-codecs", feature = "pcm")
     ))]
-    fn to_block<F: num::Float + 'static>(audio: &Audio<F>) -> InterleavedView<'_, F> {
+    fn to_block<F: num_traits::Float + 'static>(audio: &Audio<F>) -> InterleavedView<'_, F> {
         InterleavedView::from_slice(&audio.samples_interleaved, audio.num_channels)
     }
 

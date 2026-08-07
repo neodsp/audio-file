@@ -107,6 +107,11 @@
 - Dependency housekeeping: `hound` is gone, the internal `audioadapter-buffers`
   dependency moved to 4, and `approx` moved to the dev-dependencies. None of them
   is part of the public API.
+- `num` is replaced by `num-traits`, which is the only part of it this crate ever
+  used. The `num` facade pulled in `num-bigint`, `num-rational` and `num-iter`
+  for nothing. `num::Float` is a re-export of `num_traits::Float`, the same trait
+  from the same crate, so the bound on `read`, `read_block` and `write` is
+  unchanged and code written against `num::Float` still compiles.
 
 ## New Error Variants
 

@@ -13,7 +13,7 @@ version = "0.5.0"
 
 [dependencies]
 audioadapter-buffers = "4"
-num = "0.4"
+num-traits = "0.2"
 rubato = "4"
 symphonia = { version = "0.6", default-features = false }
 thiserror = "2"

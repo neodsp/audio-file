@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use num::Float;
+use num_traits::Float;
 use thiserror::Error;
 
 use crate::wav;
