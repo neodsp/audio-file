@@ -90,9 +90,11 @@
 
 - `ReadError`: `NoChannels`, `TooManyChannels`, `InvalidChannelRange`,
   `ChannelCountChanged`, `SampleRateChanged`
-- `WriteError`: `ZeroChannels` and `UnalignedSamples`. Writing with zero
-  channels or a sample count that is not a multiple of the channel count is now
-  rejected before the file is created.
+- `WriteError`: `ZeroChannels`, `ZeroSampleRate`, and `UnalignedSamples`.
+  Writing with zero channels, a zero sample rate, or a sample count that is not
+  a multiple of the channel count is now rejected before the file is created. A
+  zero sample rate used to produce a file with no timeline, which this crate
+  could not read back through its own wav decoder.
 - `WriteError`: `FileTooLarge`, `FrameTooLarge`, and `ByteRateTooHigh`. Wav
   describes its sizes in 32-bit and 16-bit fields, which caps a file at 4 GiB, a
   frame at 65535 bytes, and the byte rate at what `nAvgBytesPerSec` can hold.

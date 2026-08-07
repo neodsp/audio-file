@@ -106,12 +106,15 @@
 //!
 //! ## Known Limitations
 //!
-//! Reading is delegated to Symphonia, which maps channels to named speaker positions instead of
-//! treating them as a plain count. Several containers therefore have a read-back channel ceiling
-//! well below what the format itself allows:
+//! WAV files with integer PCM or IEEE float samples, which is everything this crate itself
+//! writes, are read by a native decoder with no channel ceiling. Every other format is decoded
+//! through Symphonia, which maps channels to named speaker positions instead of treating them as
+//! a plain count. Several containers therefore have a read-back channel ceiling well below what
+//! the format itself allows:
 //!
-//! - **WAV** files with an extensible `fmt` chunk are rejected above 18 channels, files with a
-//!   plain `fmt` chunk above 26.
+//! - **WAV** files this native decoder cannot handle - ADPCM, A-law/mu-law and other compressed
+//!   encodings - fall back to Symphonia, which is rejected above 18 channels for an extensible
+//!   `fmt` chunk, or 26 for a plain one.
 //! - **CAF** files with high channel counts are unreliable: a 24-channel file is silently
 //!   decoded as 18 channels with misaligned samples, and 32 channels is rejected.
 //! - **Matroska** has no such ceiling, since channels are treated as discrete. 24 and 32
@@ -119,10 +122,7 @@
 //! - **FLAC** is limited to 8 channels by the format itself, so it is no alternative for high
 //!   channel counts.
 //!
-//! This crate writes the extensible WAV layout above two channels, so its own files with 19 or
-//! more channels cannot be read back by this crate. The files are valid, and other readers such
-//! as ffmpeg and libsndfile accept them. For high channel counts, prefer Matroska. A future
-//! version may read PCM wav without Symphonia to lift the wav ceilings.
+//! For high channel counts in a compressed format, prefer Matroska.
 //!
 //! ## Read and Write Options
 //!

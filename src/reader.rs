@@ -104,7 +104,10 @@ pub struct ReadConfig {
 /// Upper bound for the pre-allocation derived from the container metadata, so
 /// that a bogus frame count cannot request a huge allocation up front. The
 /// buffer still grows beyond this if the file really is that long.
-const MAX_PREALLOC_SAMPLES: usize = 16 * 1024 * 1024;
+///
+/// Both decoding paths respect it, so a hostile header costs the same either
+/// way.
+pub(crate) const MAX_PREALLOC_SAMPLES: usize = 16 * 1024 * 1024;
 
 /// Read an audio file from disk.
 ///
@@ -330,7 +333,53 @@ fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, ReadError> {
     )?)
 }
 
+/// Attempts the WAV fast path: parsing the header directly and reading only
+/// the requested bytes. PCM audio in a WAV file is a flat byte array, so a
+/// frame range and a channel range are read by indexing into it directly,
+/// with none of the packet timestamps, decoder warm-up or seek verification
+/// the general path below needs for compressed formats.
+///
+/// Returns `Ok(None)` for anything the native decoder does not handle - a
+/// file that is not WAV, or a WAV sample encoding it does not decode, such
+/// as ADPCM - so the caller falls back to the general path.
+fn try_native_wav<F: Float>(
+    path: &Path,
+    config: &ReadConfig,
+) -> Result<Option<Decoded<F>>, ReadError> {
+    let file = File::open(path)?;
+    let Some(wav) = crate::wav::open_wav(file)? else {
+        return Ok(None);
+    };
+
+    let plan = Plan::resolve(wav.sample_rate, wav.num_channels, config)?;
+    let samples = crate::wav::read_frames::<F>(
+        wav,
+        plan.start_frame,
+        plan.end_frame,
+        plan.layout.start,
+        plan.layout.count,
+    )?;
+
+    Ok(Some(Decoded {
+        samples,
+        num_channels: plan.layout.count,
+        sample_rate: plan.sample_rate,
+    }))
+}
+
 fn decode<F: Float>(path: &Path, config: &ReadConfig) -> Result<Decoded<F>, ReadError> {
+    if let Some(decoded) = try_native_wav(path, config)? {
+        return Ok(decoded);
+    }
+    decode_with_symphonia(path, config)
+}
+
+/// The general decoding path, for every format the WAV fast path above does
+/// not claim.
+fn decode_with_symphonia<F: Float>(
+    path: &Path,
+    config: &ReadConfig,
+) -> Result<Decoded<F>, ReadError> {
     let mut format = open_format(path)?;
     let dec_opts: AudioDecoderOptions = Default::default();
     let (mut track, mut decoder) = select_track(&*format, &dec_opts)?;
@@ -2266,6 +2315,203 @@ mod tests {
             Err(ReadError::InvalidChannelRange { total: 2, .. }) => (),
             other => panic!("{other:?}"),
         }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The WAV fast path and the Symphonia path must agree exactly, not
+    /// approximately: both normalize an integer sample by dividing by
+    /// `2^(bits-1)`, so every value either matches bit for bit or one of the
+    /// two is reading the file wrongly.
+    ///
+    /// This is the test that pins the sample scaling, the channel
+    /// interleaving and the frame counting all at once. Any of them could be
+    /// off by a factor of two, a channel or a frame and still look plausible
+    /// on its own.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_native_wav_matches_symphonia_exactly() {
+        use crate::writer::{SampleFormat, WriteConfig, write};
+
+        const FORMATS: [SampleFormat; 4] = [
+            SampleFormat::Int8,
+            SampleFormat::Int16,
+            SampleFormat::Int32,
+            SampleFormat::Float32,
+        ];
+
+        // Values that land on the awkward parts of every scale: full scale
+        // both ways, silence, and a spread in between.
+        let source: Vec<f32> = (0..600)
+            .map(|i| ((i as f32 / 300.0) - 1.0).clamp(-1.0, 1.0))
+            .collect();
+
+        for format in FORMATS {
+            // Stays at or below 18 channels, since above that Symphonia
+            // refuses the extensible layout and there is nothing to compare
+            // against. That ceiling is exactly what the fast path lifts.
+            for num_channels in [1u16, 2, 3, 6, 18] {
+                let frames = source.len() / usize::from(num_channels);
+                let samples = &source[..frames * usize::from(num_channels)];
+
+                let path = crate::tmp_path(&format!("diff-{format:?}-{num_channels}ch.wav"));
+                write(
+                    &path,
+                    samples,
+                    num_channels,
+                    48_000,
+                    WriteConfig {
+                        sample_format: format,
+                    },
+                )
+                .unwrap();
+
+                for config in [
+                    ReadConfig::default(),
+                    ReadConfig {
+                        start: Position::Frame(7),
+                        stop: Position::Frame(23),
+                        ..Default::default()
+                    },
+                    ReadConfig {
+                        start_channel: Some(usize::from(num_channels) - 1),
+                        ..Default::default()
+                    },
+                    ReadConfig {
+                        start: Position::Frame(3),
+                        num_channels: Some(1),
+                        ..Default::default()
+                    },
+                ] {
+                    let native = try_native_wav::<f64>(&path, &config)
+                        .unwrap()
+                        .expect("a PCM wav file must take the fast path");
+                    let symphonia = decode_with_symphonia::<f64>(&path, &config).unwrap();
+
+                    let label = format!("{format:?} {num_channels}ch");
+                    assert_eq!(native.sample_rate, symphonia.sample_rate, "{label}");
+                    assert_eq!(native.num_channels, symphonia.num_channels, "{label}");
+                    assert_eq!(
+                        native.samples, symphonia.samples,
+                        "{label}: sample values must be bit-identical"
+                    );
+                }
+
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
+
+    /// The same comparison against the checked-in fixtures, which were not
+    /// produced by this crate's encoder and so exercise a `fmt ` chunk this
+    /// crate never writes itself. It also pins that these files really do
+    /// take the fast path: if the native decoder ever started refusing them,
+    /// every other WAV test would keep passing via the fallback and say
+    /// nothing.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_native_wav_matches_symphonia_on_the_fixtures() {
+        for file in ["test_data/test_1ch.wav", "test_data/test_4ch.wav"] {
+            let path = std::path::Path::new(file);
+
+            for config in [
+                ReadConfig::default(),
+                ReadConfig {
+                    start: Position::Frame(1_000),
+                    stop: Position::Frame(1_100),
+                    ..Default::default()
+                },
+                ReadConfig {
+                    stop: Position::Time(std::time::Duration::from_secs_f32(0.25)),
+                    ..Default::default()
+                },
+            ] {
+                let native = try_native_wav::<f64>(path, &config)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{file} must take the fast path"));
+                let symphonia = decode_with_symphonia::<f64>(path, &config).unwrap();
+
+                assert_eq!(native.sample_rate, symphonia.sample_rate, "{file}");
+                assert_eq!(native.num_channels, symphonia.num_channels, "{file}");
+                assert_eq!(
+                    native.samples.len(),
+                    symphonia.samples.len(),
+                    "{file}: frame counts must agree"
+                );
+                assert_eq!(native.samples, symphonia.samples, "{file}");
+            }
+        }
+    }
+
+    /// A `WAVEFORMATEXTENSIBLE` file whose `wValidBitsPerSample` is below its
+    /// `wBitsPerSample` is read according to the container width, because the
+    /// valid bits are left-justified inside it. Reading such a file as though
+    /// the value were right-justified in the low bits takes the wrong bits
+    /// and comes out 48 dB quiet, which is the kind of error that still looks
+    /// like audio. Symphonia decides this the same way, so it can arbitrate.
+    #[cfg(all(
+        any(feature = "all-codecs", feature = "wav"),
+        any(feature = "all-codecs", feature = "pcm")
+    ))]
+    #[test]
+    fn test_extensible_valid_bits_below_container_matches_symphonia() {
+        use crate::writer::{SampleFormat, WriteConfig, write};
+
+        let samples: Vec<f32> = (0..64).map(|i| (i as f32 / 32.0) - 1.0).collect();
+        let path = crate::tmp_path("valid-bits-24-in-32.wav");
+        write(
+            &path,
+            &samples,
+            4,
+            48_000,
+            WriteConfig {
+                sample_format: SampleFormat::Int32,
+            },
+        )
+        .unwrap();
+
+        // Patch wValidBitsPerSample from 32 down to 24, leaving
+        // wBitsPerSample at 32. The sample bytes are untouched, so the
+        // correct reading is unchanged.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let fmt_body = 12 + 8;
+        let valid_bits_offset = fmt_body + 18;
+        assert_eq!(
+            u16::from_le_bytes(
+                bytes[valid_bits_offset..valid_bits_offset + 2]
+                    .try_into()
+                    .unwrap()
+            ),
+            32,
+            "the encoder should have written a full-width wValidBitsPerSample"
+        );
+        bytes[valid_bits_offset..valid_bits_offset + 2].copy_from_slice(&24u16.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let native = try_native_wav::<f64>(&path, &ReadConfig::default())
+            .unwrap()
+            .expect("still a PCM wav file");
+        let symphonia = decode_with_symphonia::<f64>(&path, &ReadConfig::default()).unwrap();
+
+        assert_eq!(native.samples, symphonia.samples);
+        // And the values are still the ones that were written, rather than
+        // the low 24 bits of them.
+        approx::assert_abs_diff_eq!(
+            native
+                .samples
+                .iter()
+                .map(|&s| s as f32)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            samples.as_slice(),
+            epsilon = 1e-6
+        );
 
         std::fs::remove_file(&path).unwrap();
     }

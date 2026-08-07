@@ -16,36 +16,24 @@
 //! speakers the caller never named.
 //!
 //! The read-back side of that choice is worth knowing. Symphonia, which this
-//! crate reads with, derives the channel layout from the mask and only knows
-//! the 18 standard speaker positions, so it rejects extensible files above 18
-//! channels while reading plain ones up to 26. The files written here are
-//! valid and other readers accept them, but from 19 channels up this crate
-//! cannot read its own output back. Writing the plain layout above 18
-//! channels instead would raise the read-back ceiling to 26, at the cost of
-//! ignoring Microsoft's "extensible above two channels" guidance.
+//! crate reads every other format with, derives the channel layout from the
+//! mask and only knows the 18 standard speaker positions, so it rejects
+//! extensible files above 18 channels while reading plain ones up to 26. The
+//! decoder in [`super::decode`] reads `nChannels` instead and never looks at
+//! the mask, so this crate does read its own output back whatever the channel
+//! count. What is left is the format's own ceiling: `nBlockAlign` is 16-bit,
+//! so a frame cannot exceed 65535 bytes, which is 16383 channels of 32-bit
+//! samples and 65535 of 8-bit ones.
 
 use std::io::{self, Write};
 
 use num::Float;
 
+use super::{
+    SUBFORMAT_IEEE_FLOAT, SUBFORMAT_PCM, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,
+    WAVE_FORMAT_PCM,
+};
 use crate::writer::{SampleFormat, WriteError};
-
-/// Integer PCM samples.
-const WAVE_FORMAT_PCM: u16 = 0x0001;
-/// IEEE float samples.
-const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
-/// The `fmt ` chunk holds a `WAVEFORMATEXTENSIBLE`, and the real format is
-/// named by its `SubFormat` GUID instead.
-const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
-
-/// `KSDATAFORMAT_SUBTYPE_PCM`, the `SubFormat` GUID for integer PCM.
-const SUBFORMAT_PCM: [u8; 16] = [
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
-];
-/// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`, the `SubFormat` GUID for float samples.
-const SUBFORMAT_IEEE_FLOAT: [u8; 16] = [
-    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
-];
 
 /// Samples converted per scratch buffer fill, so that peak memory does not
 /// scale with the length of the input.

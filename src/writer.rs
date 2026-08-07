@@ -15,6 +15,9 @@ pub enum WriteError {
     #[error("channel count must not be zero")]
     ZeroChannels,
 
+    #[error("sample rate must not be zero")]
+    ZeroSampleRate,
+
     #[error("sample count ({samples}) is not a multiple of the channel count ({channels})")]
     UnalignedSamples { samples: usize, channels: u16 },
 
@@ -59,6 +62,13 @@ pub fn write<F: Float>(
 ) -> Result<(), WriteError> {
     if num_channels == 0 {
         return Err(WriteError::ZeroChannels);
+    }
+    // A zero `nSamplesPerSec` does not describe a timeline, so the file would
+    // not be playable and this crate's own wav decoder refuses to open it.
+    // Anything that derives a frame position or a resampling ratio from the rate
+    // divides by it, so the whole file is worth rejecting over.
+    if sample_rate == 0 {
+        return Err(WriteError::ZeroSampleRate);
     }
     if !samples.len().is_multiple_of(num_channels as usize) {
         return Err(WriteError::UnalignedSamples {
@@ -248,7 +258,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Both are rejected before the file is created
+        // A file whose `nSamplesPerSec` is zero has no timeline, so it is not
+        // playable and this crate's own decoder refuses to open it. Writing it
+        // would produce a file that only the fallback decoder reads back, and
+        // then with a sample rate of zero.
+        match write::<f32>(&path, &[0.0, 0.0], 2, 0, WriteConfig::default()) {
+            Err(WriteError::ZeroSampleRate) => (),
+            other => panic!("{other:?}"),
+        }
+
+        // All three are rejected before the file is created
         assert!(!path.exists());
     }
 
@@ -347,10 +366,8 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The widest file this crate can read back again. The encoder can describe
-    /// far more channels, but the decoder rejects a `WAVEFORMATEXTENSIBLE`
-    /// naming more than 18, so 18 is where a round trip stops working. Writing
-    /// wider files stays supported; only reading them here does not.
+    /// A channel count wide enough to need the extensible layout, round
+    /// tripped through the native WAV decoder.
     #[cfg(all(
         any(feature = "all-codecs", feature = "wav"),
         any(feature = "all-codecs", feature = "pcm")
@@ -388,22 +405,26 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The other side of that ceiling: one channel more and the file this crate
-    /// just wrote is rejected by its own reader, because the extensible layout
-    /// can only name 18 speaker positions. If a future decoder learns to read
-    /// it, this fails and the documented limitation gets updated.
+    /// Symphonia's WAV reader derives the channel layout from the extensible
+    /// `dwChannelMask` and only knows 18 standard speaker positions, so it
+    /// rejects a mask naming more than that. The native decoder in
+    /// [`crate::wav`] reads `nChannels` directly and never looks at the mask,
+    /// so a file with more channels than that ceiling now round trips too.
     #[cfg(all(
         any(feature = "all-codecs", feature = "wav"),
         any(feature = "all-codecs", feature = "pcm")
     ))]
     #[test]
-    fn test_nineteen_channels_cannot_be_read_back() {
+    fn test_many_channels_can_be_read_back() {
         use super::*;
         use crate::reader::{ReadConfig, read};
 
-        let path = crate::tmp_path("19ch.wav");
-        let num_channels = 19u16;
-        let samples = vec![0.0f32; usize::from(num_channels) * 5];
+        let path = crate::tmp_path("64ch.wav");
+        let num_channels = 64u16;
+        let total = usize::from(num_channels) * 5;
+        let samples: Vec<f32> = (0..total)
+            .map(|i| (i as f32 / total as f32) - 0.5)
+            .collect();
 
         write(
             &path,
@@ -416,12 +437,13 @@ mod tests {
         )
         .unwrap();
 
-        // The decoder rejects it, so it is a symphonia error rather than a
-        // validation error of this crate
-        match read::<f32>(&path, ReadConfig::default()) {
-            Err(crate::reader::ReadError::Decode(_)) => (),
-            other => panic!("{other:?}"),
-        }
+        let audio = read::<f32>(&path, ReadConfig::default()).unwrap();
+        assert_eq!(audio.num_channels, num_channels);
+        approx::assert_abs_diff_eq!(
+            samples.as_slice(),
+            audio.samples_interleaved.as_slice(),
+            epsilon = 1e-6
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
