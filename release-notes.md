@@ -77,11 +77,33 @@
 - The documentation now states that `start` is inclusive and `stop` is
   exclusive, so reading from frame 300 to frame 400 yields 100 frames. This has
   always been the behavior.
-- Wav files are now encoded by this crate rather than by `hound`, which the
-  speaker assignment fixes below needed. Every chunk size is resolved before the
-  first byte is written, so the encoder never seeks back over its own output, and
-  a write error surfaces from `write` instead of being discovered while a buffer
-  is flushed on drop.
+- Wav is now handled by this crate on both sides, without a third party crate in
+  either direction. Encoding no longer goes through `hound`, which the speaker
+  assignment fixes below needed, and reading no longer goes through Symphonia for
+  the encodings this crate itself writes.
+- On the encoding side, every chunk size is resolved before the first byte is
+  written, so the encoder never seeks back over its own output, and a write error
+  surfaces from `write` instead of being discovered while a buffer is flushed on
+  drop.
+- On the decoding side, integer PCM and IEEE float wav files, 8/16/24/32-bit
+  integer (including 24 bits in a 4-byte container) and 32/64-bit float, are read
+  by a native decoder. PCM in a wav file is a flat byte array, so a frame range
+  and a channel range are resolved by indexing into it, with none of the packet
+  timestamps, decoder warm-up and seek verification a compressed format needs.
+  Only the requested bytes are read, so a short selection out of a long file no
+  longer decodes everything before it. Anything the native decoder does not cover
+  - ADPCM, A-law/mu-law, an unrecognised format tag, or a file that is not
+  RIFF/WAVE - falls back to Symphonia, so no file that used to be readable
+  stopped being readable.
+- Wav files with high channel counts can now be read back. Symphonia derives the
+  channel layout from the extensible `dwChannelMask` and only knows 18 standard
+  speaker positions, so it rejected a mask naming more than that, and files this
+  crate wrote with 19 or more channels could not be read by this crate. The
+  native decoder reads `nChannels` and never looks at the mask, because this
+  crate reports a channel count and not a speaker layout, so there is no channel
+  ceiling on wav anymore. Reading 64 channels back out of a file this crate wrote
+  is now a test. The ceilings on the other containers are unchanged and still
+  documented under Known Limitations.
 - Dependency housekeeping: `hound` is gone, the internal `audioadapter-buffers`
   dependency moved to 4, and `approx` moved to the dev-dependencies. None of them
   is part of the public API.
