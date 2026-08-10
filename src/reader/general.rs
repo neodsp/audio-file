@@ -854,19 +854,22 @@ mod tests {
 
         // Resampling must start from the decoded rate, so asking for the rate
         // the file really has must not change its length.
-        let resampled = crate::reader::read::<f32>(
-            PATH,
-            ReadConfig {
-                sample_rate: Some(44_100),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(resampled.sample_rate, 44_100);
-        assert_eq!(
-            resampled.samples_interleaved.len(),
-            full.samples_interleaved.len()
-        );
+        #[cfg(feature = "resample")]
+        {
+            let resampled = crate::reader::read::<f32>(
+                PATH,
+                ReadConfig {
+                    sample_rate: Some(44_100),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(resampled.sample_rate, 44_100);
+            assert_eq!(
+                resampled.samples_interleaved.len(),
+                full.samples_interleaved.len()
+            );
+        }
     }
 
     /// A packet the decoder rejects fails the whole read. The alternative would

@@ -1,9 +1,9 @@
 //! Reading audio files.
 //!
 //! Two decoders share the work: the wav fast path right here in this module,
-//! and [`general`], the Symphonia-backed path for every other format, which
-//! only exists when the `symphonia` feature is on. [`decode`] is where the two
-//! meet - it tries the wav path first and only reaches for [`general`] when
+//! and `general`, the Symphonia-backed path for every other format, which
+//! only exists when the `symphonia` feature is on. `decode` is where the two
+//! meet - it tries the wav path first and only reaches for `general` when
 //! that declines the file.
 
 use std::fs::File;
@@ -12,10 +12,27 @@ use std::path::Path;
 use num_traits::Float;
 use thiserror::Error;
 
+#[cfg(feature = "resample")]
 use crate::resample::{ResampleError, resample};
 
 #[cfg(feature = "symphonia")]
 mod general;
+
+/// What [`read`] needs of a sample type beyond being a float, which is whatever
+/// the resampler needs of it. With the `resample` feature that is
+/// `rubato::Sample`.
+#[cfg(feature = "resample")]
+pub use rubato::Sample as ResampleSample;
+
+/// What [`read`] needs of a sample type beyond being a float. Without the
+/// `resample` feature nothing is resampled, so this asks for nothing and every
+/// type satisfies it. It exists so that the bound on [`read`] reads the same in
+/// either build.
+#[cfg(not(feature = "resample"))]
+pub trait ResampleSample {}
+
+#[cfg(not(feature = "resample"))]
+impl<F> ResampleSample for F {}
 
 /// Audio data with interleaved samples
 #[derive(Debug, Clone)]
@@ -89,6 +106,7 @@ pub enum ReadError {
     #[error("frames {start}..{end} are missing, the file is damaged or incomplete")]
     MissingFrames { start: u64, end: u64 },
 
+    #[cfg(feature = "resample")]
     #[error("resample failed")]
     Resample(#[from] ResampleError),
 }
@@ -115,7 +133,11 @@ pub struct ReadConfig {
     pub start_channel: Option<usize>,
     /// Number of channels to extract. None means extract all remaining channels.
     pub num_channels: Option<usize>,
-    /// If specified the audio will be resampled to the given sample rate
+    /// If specified the audio will be resampled to the given sample rate.
+    ///
+    /// Only present with the `resample` feature, so that a build without it
+    /// cannot ask for a rate that nothing would resample to.
+    #[cfg(feature = "resample")]
     pub sample_rate: Option<u32>,
 }
 
@@ -135,27 +157,49 @@ pub(crate) const MAX_PREALLOC_SAMPLES: usize = 16 * 1024 * 1024;
 /// The `stop` position of [`ReadConfig`] is exclusive, so reading from frame 100
 /// to frame 200 yields 100 frames. A `start` position beyond the end of the file
 /// yields no samples.
-pub fn read<F: Float + rubato::Sample>(
+pub fn read<F: Float + ResampleSample>(
     path: impl AsRef<Path>,
     config: ReadConfig,
 ) -> Result<Audio<F>, ReadError> {
     let decoded = decode::<F>(path.as_ref(), &config)?;
-
-    let samples = match config.sample_rate {
-        Some(sr_out) if sr_out != decoded.sample_rate => resample(
-            &decoded.samples,
-            decoded.num_channels,
-            decoded.sample_rate,
-            sr_out,
-        )?,
-        _ => decoded.samples,
-    };
+    let num_channels = checked_num_channels(decoded.num_channels)?;
+    let (samples, sample_rate) = resolve_output_rate(decoded, &config)?;
 
     Ok(Audio {
         samples_interleaved: samples,
-        sample_rate: config.sample_rate.unwrap_or(decoded.sample_rate),
-        num_channels: checked_num_channels(decoded.num_channels)?,
+        sample_rate,
+        num_channels,
     })
+}
+
+/// Resample to the rate requested in `config`, if any and if it differs from
+/// the decoded rate. Without the `resample` feature there is no rate to
+/// resample to, so the decoded audio passes through unchanged.
+#[cfg(feature = "resample")]
+fn resolve_output_rate<F: Float + ResampleSample>(
+    decoded: Decoded<F>,
+    config: &ReadConfig,
+) -> Result<(Vec<F>, u32), ReadError> {
+    Ok(match config.sample_rate {
+        Some(sr_out) if sr_out != decoded.sample_rate => (
+            resample(
+                &decoded.samples,
+                decoded.num_channels,
+                decoded.sample_rate,
+                sr_out,
+            )?,
+            sr_out,
+        ),
+        _ => (decoded.samples, decoded.sample_rate),
+    })
+}
+
+#[cfg(not(feature = "resample"))]
+fn resolve_output_rate<F>(
+    decoded: Decoded<F>,
+    _config: &ReadConfig,
+) -> Result<(Vec<F>, u32), ReadError> {
+    Ok((decoded.samples, decoded.sample_rate))
 }
 
 /// The channel count is reported as a `u16`, so a stream with more channels than
@@ -326,7 +370,7 @@ fn position_to_frame(position: Position, sample_rate: u32) -> Option<usize> {
 }
 
 #[cfg(feature = "audio-blocks")]
-pub fn read_block<F: num_traits::Float + 'static + rubato::Sample>(
+pub fn read_block<F: num_traits::Float + 'static + ResampleSample>(
     path: impl AsRef<Path>,
     config: ReadConfig,
 ) -> Result<(audio_blocks::Interleaved<F>, u32), ReadError> {
@@ -398,7 +442,8 @@ mod tests {
                     stop: Position::Frame(9),
                     start_channel: Some(1),
                     num_channels: Some(2),
-                    ..Default::default()
+                    #[cfg(feature = "resample")]
+                    sample_rate: None,
                 },
             )
             .unwrap();
@@ -656,6 +701,7 @@ mod tests {
         assert!(!error.to_string().is_empty());
     }
 
+    #[cfg(feature = "resample")]
     #[test]
     fn test_resample_preserves_frequency() {
         const FREQUENCIES: [f64; 4] = [440.0, 554.37, 659.25, 880.0];
@@ -709,6 +755,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "resample")]
     #[test]
     fn test_channel_selection_with_resampling() {
         // This test verifies that channel selection combined with resampling works correctly
@@ -812,7 +859,8 @@ mod tests {
             stop: Position::Time(std::time::Duration::from_millis(20)),
             start_channel: Some(1),
             num_channels: Some(2),
-            ..Default::default()
+            #[cfg(feature = "resample")]
+            sample_rate: None,
         };
 
         // Frame positions follow the given sample rate, not the config
@@ -853,6 +901,7 @@ mod tests {
     }
 
     /// A stop position must not bypass the resampling step.
+    #[cfg(feature = "resample")]
     #[test]
     fn test_stop_with_resampling() {
         let sr_out: u32 = 24000;
@@ -971,17 +1020,20 @@ mod tests {
 
         // Nothing to resample, but the requested rate is still what the empty
         // audio is labelled with
-        let audio = read::<f32>(
-            &path,
-            ReadConfig {
-                start: Position::Frame(1_000_000),
-                sample_rate: Some(24_000),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(audio.sample_rate, 24_000);
-        assert!(audio.samples_interleaved.is_empty());
+        #[cfg(feature = "resample")]
+        {
+            let audio = read::<f32>(
+                &path,
+                ReadConfig {
+                    start: Position::Frame(1_000_000),
+                    sample_rate: Some(24_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(audio.sample_rate, 24_000);
+            assert!(audio.samples_interleaved.is_empty());
+        }
 
         let audio = read::<f32>(
             &path,
@@ -1046,7 +1098,8 @@ mod tests {
             stop: Position::Frame(1_500),
             start_channel: Some(1),
             num_channels: Some(2),
-            ..Default::default()
+            #[cfg(feature = "resample")]
+            sample_rate: None,
         };
 
         let audio = read::<f32>("test_data/test_4ch.wav", config()).unwrap();
@@ -1072,17 +1125,20 @@ mod tests {
         assert!(audio.samples_interleaved.is_empty());
 
         // Resampling nothing must not fail
-        let audio = read::<f32>(
-            &path,
-            ReadConfig {
-                sample_rate: Some(24000),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(audio.num_channels, 2);
-        assert_eq!(audio.sample_rate, 24000);
-        assert!(audio.samples_interleaved.is_empty());
+        #[cfg(feature = "resample")]
+        {
+            let audio = read::<f32>(
+                &path,
+                ReadConfig {
+                    sample_rate: Some(24000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(audio.num_channels, 2);
+            assert_eq!(audio.sample_rate, 24000);
+            assert!(audio.samples_interleaved.is_empty());
+        }
 
         // An invalid selection must be rejected even without any audio frames
         match read::<f32>(

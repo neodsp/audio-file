@@ -78,11 +78,14 @@ Other flags:
 
 - `all-codecs` (default) enables every format in the table above.
 - `simd` (default) enables Symphonia's SIMD optimizations.
+- `resample` (default) enables resampling while reading, via `rubato`.
 - `audio-blocks` enables `read_block` and `write_block`.
 
 With default features off, wav with integer PCM or IEEE float samples, which is everything this
-crate writes, is still read by a built-in decoder, and Symphonia is not in the dependency tree
-at all. Any other file then fails with `ReadError::UnsupportedFormat`.
+crate writes, is still read by a built-in decoder, and neither Symphonia nor `rubato` is in the
+dependency tree at all: eight crates instead of forty-six. Any other file then fails with
+[`ReadError::UnsupportedFormat`](https://docs.rs/audio-file/latest/audio_file/reader/enum.ReadError.html#variant.UnsupportedFormat), and [`ReadConfig`](https://docs.rs/audio-file/latest/audio_file/reader/struct.ReadConfig.html) loses its `sample_rate` field along with
+the resampler, so asking for a rate nothing would resample to does not compile.
 
 ## Known Limitations
 
@@ -105,7 +108,7 @@ When reading a file you can specify the following things:
 
 - Start and stop in frames or time
 - Start channel and number of channels
-- Optional resampling
+- Optional resampling, with the `resample` feature
 
 Only selected frames are stored. The reader may decode and discard earlier packets for accurate
 seeking and codec warm-up.
@@ -118,7 +121,7 @@ as used by formats like MP3, are not part of the timeline.
 
 A file is either read in full or not at all. A packet the decoder rejects, because the file is
 damaged, was truncated mid-transfer, or holds an encoding this build has no codec for, ends the
-read with `ReadError::Decode`. Nothing is skipped over or filled in.
+read with [`ReadError::Decode`](https://docs.rs/audio-file/latest/audio_file/reader/enum.ReadError.html#variant.Decode). Nothing is skipped over or filled in.
 
 ### Writing
 

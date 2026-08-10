@@ -26,12 +26,47 @@ jobs:
       - run: cargo test --locked --doc --workspace
       - run: cargo test --locked --all-features --doc --workspace
 
+  minimal:
+    name: 🪶 Minimal Build (no features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --no-default-features --all-targets --workspace
+        # The doc examples that need an optional feature are cfg'd out rather
+        # than skipped, so they have to keep compiling here too.
+      - run: cargo test --locked --no-default-features --doc --workspace
+        # What the minimal build is for: wav in and wav out, with none of the
+        # optional dependencies. A feature that starts pulling one of them in
+        # unconditionally has to fail here rather than in someone's build.
+      - name: Verify no optional dependency is in the tree
+        shell: bash
+        run: |
+          cargo tree --locked --no-default-features -e normal --prefix none | tee tree.txt
+          if grep -qE '^(symphonia|rubato|audioadapter-buffers|audio-blocks) ' tree.txt; then
+            echo "Unexpected optional dependency in the minimal build"
+            exit 1
+          fi
+
   reduced-features:
     name: 🧪 Reduced Features (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["wav,pcm", "ogg,vorbis", "isomp4,aac", "mkv,flac", "mp3"]
+        # One entry per optional dependency that is not a codec, so that each is
+        # exercised on its own, plus a container/codec pair per Symphonia format.
+        # None of them enables `resample`, so every one of these also covers the
+        # reader without the resampler.
+        features:
+          [
+            "resample",
+            "audio-blocks",
+            "wav-compressed",
+            "ogg,vorbis",
+            "isomp4,aac",
+            "mkv,flac",
+            "mp3",
+          ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,12 +77,15 @@ jobs:
         #
         # --all-targets skips the doc tests, which all read the WAV fixtures.
       - run: cargo test --locked --no-default-features --features ${{ matrix.features }} --all-targets --workspace
-      - name: Verify WAV/PCM feature isolation
-        if: matrix.features == 'wav,pcm'
+        # `wav-compressed` is the narrowest Symphonia selection there is, so it is
+        # where an accidental widening of the dependency shows up first. `wav`,
+        # `pcm` and `adpcm` are what it is meant to enable; anything else is not.
+      - name: Verify wav-compressed feature isolation
+        if: matrix.features == 'wav-compressed'
         shell: bash
         run: |
-          cargo tree -e features --no-default-features --features wav,pcm -i symphonia | tee symphonia-features.txt
-          if grep -E 'symphonia feature "(default|opt-simd|aac|adpcm|aiff|alac|caf|flac|isomp4|mkv|mp1|mp2|mp3|ogg|vorbis)"' symphonia-features.txt; then
-            echo "Unexpected Symphonia feature enabled by wav,pcm"
+          cargo tree -e features --no-default-features --features wav-compressed -i symphonia | tee symphonia-features.txt
+          if grep -E 'symphonia feature "(default|opt-simd|aac|aiff|alac|caf|flac|isomp4|mkv|mp1|mp2|mp3|ogg|vorbis)"' symphonia-features.txt; then
+            echo "Unexpected Symphonia feature enabled by wav-compressed"
             exit 1
           fi

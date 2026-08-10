@@ -37,9 +37,15 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --locked --all-features --all-targets --workspace -- -D warnings
-        # The optional codec features cfg out parts of the tests, so lint a
-        # reduced set as well instead of only the complete one.
-      - run: cargo clippy --locked --no-default-features --features wav,pcm --all-targets --workspace -- -D warnings
+        # The optional features cfg out parts of the crate and its tests, so lint
+        # both ends of the range instead of only the complete one: nothing
+        # enabled at all, and each optional dependency that is not a codec on its
+        # own. `audio-blocks` without `resample` is its own combination, because
+        # the tests it adds build a `ReadConfig` that has one field fewer.
+      - run: cargo clippy --locked --no-default-features --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features resample --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features audio-blocks --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features wav-compressed --all-targets --workspace -- -D warnings
 
   doc:
     name: 📚 Documentation

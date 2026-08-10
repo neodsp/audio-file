@@ -97,11 +97,14 @@
 //!
 //! - `all-codecs` (default) enables every format in the table above.
 //! - `simd` (default) enables Symphonia's SIMD optimizations.
+//! - `resample` (default) enables resampling while reading, via `rubato`.
 //! - `audio-blocks` enables `read_block` and `write_block`.
 //!
 //! With default features off, wav with integer PCM or IEEE float samples, which is everything this
-//! crate writes, is still read by a built-in decoder, and Symphonia is not in the dependency tree
-//! at all. Any other file then fails with [`ReadError::UnsupportedFormat`].
+//! crate writes, is still read by a built-in decoder, and neither Symphonia nor `rubato` is in the
+//! dependency tree at all: eight crates instead of forty-six. Any other file then fails with
+//! [`ReadError::UnsupportedFormat`], and [`ReadConfig`] loses its `sample_rate` field along with
+//! the resampler, so asking for a rate nothing would resample to does not compile.
 //!
 //! ## Known Limitations
 //!
@@ -124,7 +127,7 @@
 //!
 //! - Start and stop in frames or time
 //! - Start channel and number of channels
-//! - Optional resampling
+//! - Optional resampling, with the `resample` feature
 //!
 //! Only selected frames are stored. The reader may decode and discard earlier packets for accurate
 //! seeking and codec warm-up.
@@ -156,6 +159,7 @@
 //! - resample to 22.05 kHz while reading
 //!
 //! ```rust
+//! # #[cfg(feature = "resample")]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let audio = audio_file::read::<f32>(
 //!     "test_data/test_1ch.wav",
@@ -166,6 +170,8 @@
 //! )?;
 //! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "resample"))]
+//! # fn main() {}
 //! ```
 //!
 //! - read the first 0.5 seconds
@@ -260,12 +266,14 @@ pub use audio_blocks::*;
 #[cfg(feature = "audio-blocks")]
 pub use reader::read_block;
 pub use reader::{Audio, Position, ReadConfig, ReadError, read};
+#[cfg(feature = "resample")]
 pub use resample::ResampleError;
 #[cfg(feature = "audio-blocks")]
 pub use writer::write_block;
 pub use writer::{SampleFormat, WriteConfig, WriteError, write};
 
 pub mod reader;
+#[cfg(feature = "resample")]
 mod resample;
 mod wav;
 pub mod writer;

@@ -12,23 +12,34 @@ rust-version = "1.88"
 version = "0.5.0"
 
 [dependencies]
-audioadapter-buffers = "4"
 num-traits = "0.2"
-rubato = "4"
-symphonia = { version = "0.6", default-features = false, optional = true }
 thiserror = "2"
 
 audio-blocks = { version = "0.7", optional = true }
+audioadapter-buffers = { version = "4", optional = true }
+rubato = { version = "4", optional = true }
+symphonia = { version = "0.6", default-features = false, optional = true }
 
 [dev-dependencies]
 approx = "0.5"
 audio-blocks = { version = "0.7" }
 
 [features]
-default = ["all-codecs", "simd"]
+default = ["all-codecs", "resample", "simd"]
 
 # Add utility functions for channel access etc
 audio-blocks = ["dep:audio-blocks"]
+
+# Resample while reading, via rubato. Enabled by default; turn it off along
+# with the other default features for the most minimal build, wav in and out
+# with no resampling and neither rubato nor Symphonia in the dependency tree.
+resample = ["dep:audioadapter-buffers", "dep:rubato"]
+
+# Symphonia's SIMD optimizations. A modifier rather than an enabler, so it does
+# nothing in a build without Symphonia. Not free either way: it brings `rustfft`
+# and the four crates behind it into the tree, which is why it is a knob at all
+# and not simply always on wherever Symphonia is.
+simd = ["symphonia?/opt-simd"]
 
 # Read anything the built-in wav decoder does not cover, through Symphonia.
 # Every codec feature below enables it, so it is rarely named on its own. Without
@@ -47,12 +58,10 @@ all-codecs = ["symphonia", "symphonia/all"]
 # none of them, so a `wav` feature would pull all of Symphonia in while widening
 # what can be read by nothing at all: integer PCM and IEEE float already read
 # with no feature, and an A-law file would still fail for want of a codec.
-wav-compressed = ["symphonia", "symphonia/wav", "pcm", "adpcm"]
+wav-compressed = ["adpcm", "pcm", "symphonia", "symphonia/wav"]
 
-# Enable Symphonia's SIMD optimizations. A modifier rather than an enabler, so it
-# does nothing in a build without Symphonia.
-simd = ["symphonia?/opt-simd"]
-
+# Individual containers and codecs. A container and the codec inside it are
+# separate features, so a format that can hold several codecs needs one of each.
 aac = ["symphonia", "symphonia/aac"]
 adpcm = ["symphonia", "symphonia/adpcm"]
 aiff = ["symphonia", "symphonia/aiff"]

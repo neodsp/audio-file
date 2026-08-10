@@ -37,6 +37,12 @@
   feature enables it and the default feature set enables all of them, so this
   only affects builds with default features off. See below for what such a build
   can still do.
+- `rubato` is now an optional dependency, behind the new `resample` feature,
+  which the default feature set enables. Without it there is no resampler, so
+  `ReadConfig` has no `sample_rate` field, `ReadError::Resample` and
+  `ResampleError` do not exist, and the sample type bound on `read` and
+  `read_block` asks for nothing beyond `Float`. Like `symphonia`, this only
+  affects builds with default features off.
 
 ## Improvements
 
@@ -119,11 +125,16 @@
   is part of the public API.
 - `symphonia` is optional. Wav files holding integer PCM or IEEE float samples,
   which is everything this crate writes, are read by the built-in decoder, so a
-  build with default features off writes wav, reads wav, resamples, and pulls no
-  `symphonia` at all. That is 23 crates in the dependency tree instead of 46.
-  Every codec feature (`mp3`, `flac`, `mkv`, ...) enables it, so nothing changes
-  for anyone who names a format. `simd` is now a modifier rather than an enabler
-  and does nothing on its own in a build without `symphonia`.
+  build that drops `symphonia` still writes wav, reads wav and resamples, with 23
+  crates in the dependency tree instead of 46. Every codec feature (`mp3`,
+  `flac`, `mkv`, ...) enables it, so nothing changes for anyone who names a
+  format. `simd` is now a modifier rather than an enabler and does nothing on its
+  own in a build without `symphonia`.
+- `rubato` is optional too, behind the `resample` feature. Dropping it as well
+  leaves 8 crates in the dependency tree instead of 46, for a build that writes
+  wav and reads the wav it writes, which is the smallest this crate gets. The
+  feature is on by default, so resampling is still there unless it is turned off
+  on purpose.
 - The `wav` feature is replaced by `wav-compressed`, which adds the wav encodings the
   built-in decoder does not cover: A-law, mu-law and ADPCM. Symphonia splits the
   RIFF demuxer from the encodings inside it, so the old `wav` feature was the
