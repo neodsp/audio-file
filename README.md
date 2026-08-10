@@ -2,7 +2,9 @@
 
 # audio-file
 
-Read audio files, write wav. Two functions, no ceremony.
+A simple library to read and write audio files on your disk.
+
+The library can read many formats and can write only to wav files.
 
 ## Quick Start
 
@@ -32,7 +34,7 @@ audio_file::write(
 )?;
 ```
 
-That is the whole surface. Everything below is optional.
+That covers most uses. Everything below is optional.
 
 ## Features
 
