@@ -31,11 +31,14 @@ pub struct Audio<F> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReadError {
-    #[error("could not read file")]
+    #[error("could not read file: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A packet the decoder rejected. The file is damaged, truncated, or in an
+    /// encoding this build cannot decode. Nothing is skipped over: a file that
+    /// cannot be decoded in full is not read at all.
     #[cfg(feature = "symphonia")]
-    #[error("could not decode audio")]
+    #[error("could not decode audio: {0}")]
     Decode(#[from] symphonia::core::errors::Error),
 
     /// No decoder in this build can read the file. Only reachable without the
@@ -79,6 +82,12 @@ pub enum ReadError {
 
     #[error("sample rate changed mid-stream (was {expected}, now {found})")]
     SampleRateChanged { expected: u32, found: u32 },
+
+    /// Frames the stream never delivered, which the read cannot leave out
+    /// without moving every later frame off the position it was asked for.
+    #[cfg(feature = "symphonia")]
+    #[error("frames {start}..{end} are missing, the file is damaged or incomplete")]
+    MissingFrames { start: u64, end: u64 },
 
     #[error("resample failed")]
     Resample(#[from] ResampleError),

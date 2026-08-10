@@ -49,10 +49,15 @@
 - Seeking for large start offsets now aims one second early instead of 10%
   early, giving codecs with inter-frame dependencies a fixed amount of time to
   warm up.
-- Malformed packets are skipped when the stream position can be recovered from
-  timestamps, instead of failing the whole read. The frames such a packet would
-  have carried are filled with silence, so that every later frame stays at its
-  own position instead of moving earlier by the number of missing frames.
+- A packet the decoder rejects now fails the read with `ReadError::Decode`
+  instead of being skipped over. A damaged, truncated, or partially unsupported
+  file cannot be read into a plain buffer of samples without either shortening
+  it or padding it with silence the file never contained, and a caller cannot
+  tell either of those apart from real audio. Reading a file the crate cannot
+  decode in full is therefore an error, and what is wrong with it is stated
+  rather than concealed.
+- `ReadError::Io` and `ReadError::Decode` now include the underlying error in
+  their message, so the cause is visible without walking the `source` chain.
 - Support for chained streams (e.g. concatenated OGG files): the decoder is
   rebuilt when the track list changes, and the timeline continues across
   streams.
@@ -138,6 +143,9 @@
 
 - `ReadError`: `NoChannels`, `TooManyChannels`, `InvalidChannelRange`,
   `ChannelCountChanged`, `SampleRateChanged`
+- `ReadError`: `MissingFrames`, for a stream that skips frames across a
+  discontinuity. Leaving them out would move every later frame off the position
+  it was asked for.
 - `ReadError`: `UnsupportedFormat`, for a file no decoder in the build can read.
   Only reachable without the `symphonia` feature, where the built-in wav decoder
   is the whole reader and anything it declines has nowhere left to go.

@@ -7,6 +7,9 @@
 //! landing has to be verified rather than trusted. Everything below exists to
 //! turn that into the same frame-exact, channel-exact read the wav path gets
 //! from indexing into a byte array.
+//!
+//! It repairs nothing: a packet the decoder rejects ends the read with an error
+//! rather than being skipped over.
 
 use std::fs::File;
 use std::path::Path;
@@ -94,14 +97,6 @@ fn prepare_track(
 }
 
 impl Plan {
-    /// Number of frames the caller asked for, if the read is bounded by a stop
-    /// position. Unlike [`Self::expected_frames`] this does not consult the
-    /// container, so it is a bound the caller set and not one a file can claim.
-    fn requested_frames(&self) -> Option<usize> {
-        self.end_frame
-            .map(|end| end.saturating_sub(self.start_frame))
-    }
-
     /// Number of frames the read is expected to yield, if the file length is
     /// known.
     fn expected_frames(&self, num_frames: Option<u64>) -> Option<usize> {
@@ -173,14 +168,9 @@ pub(super) fn decode_with_symphonia<F: Float>(
     // Set while a seek landing still has to be checked against the requested
     // start, which can only be done once a packet after it has been positioned.
     let mut unverified_landing = false;
-    // Last position that was known exactly before a discarded packet left a hole,
-    // and the origin of the grid the next position is snapped to. Only a discarded
-    // packet keeps the timeline around the hole intact; a seek or a decoder reset
-    // is a real discontinuity, where no grid carries over.
-    let mut grid_anchor: Option<u64> = None;
-    // Never copy the same absolute frame twice if timestamp-based recovery after
-    // a decode error lands before data that was already returned. Set to the
-    // start frame as soon as the plan is resolved.
+    // First frame that has not been written to the output yet. Set to the start
+    // frame as soon as the plan is resolved. A packet that begins beyond it means
+    // the stream skipped frames the output has no way to leave out.
     let mut copied_until = 0u64;
 
     loop {
@@ -205,10 +195,9 @@ pub(super) fn decode_with_symphonia<F: Float>(
                 decoder = next_decoder;
                 track = next;
                 // Keep `position` for normal decoding, and retain the boundary as
-                // the base if a later error requires re-anchoring from this new
+                // the base if a later reset requires re-anchoring from this new
                 // stream's zero-based timestamps.
                 stream_base = position.unwrap_or(stream_base);
-                grid_anchor = None;
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -220,30 +209,19 @@ pub(super) fn decode_with_symphonia<F: Float>(
 
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            // A malformed packet is discardable and decoding may continue with
-            // the next one, but only if the position can be recovered from its
-            // timestamp. Without a time base the discarded frames would shift
-            // everything that follows, so the error is propagated instead.
-            Err(Error::DecodeError(_) | Error::IoError(_)) if track.time_base.is_some() => {
-                // The number of frames lost with this packet is unknown. Let the
-                // next non-empty packet establish a new position instead of
-                // shifting all later decoded frames by the missing amount. Keep
-                // the position before the hole as the grid origin, including
-                // across a run of several discarded packets.
-                grid_anchor = position.or(grid_anchor);
-                position = None;
-                continue;
-            }
             // The audio specification of the decoded audio may change after a
             // reset, which is picked up from the next packet.
             Err(Error::ResetRequired) => {
                 decoder.reset();
                 position = None;
-                // The reset is a discontinuity, not a hole in an otherwise intact
-                // timeline.
-                grid_anchor = None;
                 continue;
             }
+            // A packet the decoder rejects means the file is damaged, truncated,
+            // or in an encoding this build cannot decode. Its frames are simply
+            // gone: their number is not even known, so nothing can take their
+            // place, and continuing would either shift the rest of the read off
+            // its positions or present invented silence as audio. Neither is
+            // something the caller could detect, so the read fails instead.
             Err(err) => return Err(err.into()),
         };
 
@@ -317,9 +295,6 @@ pub(super) fn decode_with_symphonia<F: Float>(
                         decoder.reset();
                         position = None;
                         unverified_landing = true;
-                        // The landing is a discontinuity, so a hole from before it
-                        // cannot put the frames after it on a grid.
-                        grid_anchor = None;
                     } else {
                         // A failed seek is not guaranteed to leave every format
                         // reader at its original position. Reopening is also the
@@ -329,9 +304,6 @@ pub(super) fn decode_with_symphonia<F: Float>(
                         format = open_format(path)?;
                         (track, decoder) = select_track(&*format, &dec_opts)?;
                         position = Some(0);
-                        // Everything observed during the abandoned attempt refers
-                        // to positions this read no longer passes through.
-                        grid_anchor = None;
                     }
                     plan = Some(resolved);
                     continue;
@@ -351,43 +323,43 @@ pub(super) fn decode_with_symphonia<F: Float>(
             Some(position) => position,
             None if packet_frames == 0 => continue,
             None => match track.time_base {
-                Some(tb) => {
-                    let estimate = stream_base.saturating_add(timestamp_to_frame(
-                        packet.pts.get(),
-                        packet.trim_start.get(),
-                        tb,
-                        plan.sample_rate,
-                    ));
-                    // A timestamp coarser than one frame locates this packet only
-                    // to within one tick. If a discarded packet is all that stands
-                    // between it and a position that was known exactly, and the
-                    // codec spaces its packets evenly, the exact position can be
-                    // recovered from that grid instead of from the timestamp.
-                    match grid_anchor {
-                        Some(anchor) => snap_to_grid(
-                            estimate,
-                            anchor,
-                            packet_frames as u64,
-                            frames_per_tick(tb, plan.sample_rate),
-                        ),
-                        None => estimate,
-                    }
-                }
+                Some(tb) => stream_base.saturating_add(timestamp_to_frame(
+                    packet.pts.get(),
+                    packet.trim_start.get(),
+                    tb,
+                    plan.sample_rate,
+                )),
                 None => stream_base,
             },
         };
 
         // A format reader can report a landing at or before the requested start and
         // still deliver its first packet after it. The frames in between were never
-        // lost, so they are not filled with silence, and the read would quietly
-        // begin late and come up short. Decoding from the beginning always reaches
+        // lost, so the read would quietly begin late and come up short rather than
+        // being able to report anything. Decoding from the beginning always reaches
         // the requested start, which is what not seeking would have cost anyway.
         if std::mem::take(&mut unverified_landing) && packet_start > plan.start_frame as u64 {
             format = open_format(path)?;
             (track, decoder) = select_track(&*format, &dec_opts)?;
             position = Some(0);
-            grid_anchor = None;
             continue;
+        }
+
+        // Frames the output is still waiting for that this packet begins after are
+        // ones the stream did not deliver. Skipping them would move every later
+        // frame off the position it was asked for, and appending nothing in their
+        // place would return a buffer that is short without saying so. A seek
+        // landing that starts late was already caught above, so a real
+        // discontinuity in the file is what is left to get here.
+        let expected_until = match plan.end_frame {
+            Some(end) => packet_start.min(end as u64),
+            None => packet_start,
+        };
+        if expected_until > copied_until {
+            return Err(ReadError::MissingFrames {
+                start: copied_until,
+                end: expected_until,
+            });
         }
 
         let packet_end = packet_start.saturating_add(packet_frames as u64);
@@ -400,28 +372,6 @@ pub(super) fn decode_with_symphonia<F: Float>(
         };
 
         if copy_start < copy_end {
-            // Frames that were lost with a discarded packet leave a hole. Filling
-            // it with silence keeps every later frame at its own position in the
-            // output, instead of shifting the whole remainder of the read earlier
-            // by the number of missing frames.
-            //
-            // Every hole here is a genuine loss, so it is always filled. A seek
-            // landing that starts late was already caught by the landing check
-            // above, which reopens the file instead of presenting silence as
-            // audio the file never lost.
-            if copy_start > copied_until {
-                let missing = fill_frames(
-                    copy_start - copied_until,
-                    samples.len() / layout.count,
-                    layout.count,
-                    plan.requested_frames(),
-                );
-                let len = samples
-                    .len()
-                    .saturating_add(missing.saturating_mul(layout.count));
-                samples.resize(len, F::zero());
-            }
-
             let first = (copy_start - packet_start) as usize;
             let last = (copy_end - packet_start) as usize;
 
@@ -480,80 +430,12 @@ fn extend_samples<F: Float>(samples: &mut Vec<F>, src: &[f64]) {
     samples.extend(src.iter().map(|&s| F::from(s).unwrap_or_else(F::zero)));
 }
 
-/// Number of silent frames to insert for a hole of `missing` frames, after
-/// `written` frames have been produced.
-///
-/// A corrupt timestamp could ask for an enormous hole, so the fill is bounded by
-/// `requested_frames`, the length the caller asked for, and in any case by the
-/// same budget as the preallocation, since a `stop` of `usize::MAX` is a bound in
-/// name only. The container's frame count is not consulted: it is no more
-/// trustworthy than the timestamp, and understating it, which containers do,
-/// would truncate a fill the read could have completed. A truncated fill shifts
-/// every frame after it earlier, which only holes beyond the budget pay.
-fn fill_frames(
-    missing: u64,
-    written: usize,
-    channels: usize,
-    requested_frames: Option<usize>,
-) -> usize {
-    let missing = usize::try_from(missing).unwrap_or(usize::MAX);
-    let budget = MAX_PREALLOC_SAMPLES / channels.max(1);
-    let limit = match requested_frames {
-        Some(requested) => requested.saturating_sub(written).min(budget),
-        None => budget,
-    };
-    missing.min(limit)
-}
-
 /// Frame index that a signed timestamp and subsequent frame trim refer to.
 fn timestamp_to_frame(ts: i64, trim_start: u64, tb: TimeBase, sample_rate: u32) -> u64 {
     let frames = i128::from(ts) * i128::from(tb.numer.get()) * i128::from(sample_rate)
         / i128::from(tb.denom.get())
         + i128::from(trim_start);
     u64::try_from(frames).unwrap_or(if frames < 0 { 0 } else { u64::MAX })
-}
-
-/// Largest number of frames one timestamp tick can span, which bounds how far a
-/// timestamp can be from the frame it refers to.
-fn frames_per_tick(tb: TimeBase, sample_rate: u32) -> u64 {
-    let numer = u128::from(tb.numer.get()) * u128::from(sample_rate);
-    u64::try_from(numer.div_ceil(u128::from(tb.denom.get()))).unwrap_or(u64::MAX)
-}
-
-/// Round a position estimate onto the packet grid that starts at `anchor`.
-///
-/// A timestamp coarser than one frame, such as the milliseconds of a Matroska file
-/// at 44.1 kHz, locates a packet only to within one tick. A codec with a constant
-/// blocksize spaces its packets `block` frames apart, so the true position is a
-/// whole number of blocks after a position that is already known exactly, and the
-/// estimate can be rounded back onto it.
-///
-/// `block` is the frame count of the packet being positioned, which is only the
-/// real spacing if the codec has a constant blocksize and this is not its last,
-/// short packet. `tolerance` is what makes that guess safe: an estimate further
-/// than one timestamp tick from the nearest grid point is returned unchanged,
-/// because timestamp quantization cannot account for the difference. A spacing that
-/// is not the real one is therefore either rejected, or off by less than a tick,
-/// which is what the estimate already was.
-fn snap_to_grid(estimate: u64, anchor: u64, block: u64, tolerance: u64) -> u64 {
-    // Only a position ahead of the anchor can sit on the grid ahead of it.
-    let Some(ahead) = estimate.checked_sub(anchor) else {
-        return estimate;
-    };
-    // At least one packet was lost to get here, so the nearest grid point can
-    // never be the anchor itself.
-    let blocks = ahead
-        .saturating_add(block / 2)
-        .checked_div(block)
-        .unwrap_or(1)
-        .max(1);
-    let snapped = anchor.saturating_add(blocks.saturating_mul(block));
-
-    if snapped.abs_diff(estimate) <= tolerance {
-        snapped
-    } else {
-        estimate
-    }
 }
 
 /// Whether to seek to the requested start instead of decoding up to it.
@@ -676,7 +558,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_seek_is_only_worth_it_for_exact_seekable_containers() {
         let ms = TimeBase::try_new(1, 1_000).unwrap();
@@ -702,7 +583,6 @@ mod tests {
         assert_eq!(format.format_info().short_name, "matroska");
     }
 
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_only_the_selected_channels_of_the_selected_frames_are_appended() {
         // Three frames of four channels, one digit per channel
@@ -732,49 +612,6 @@ mod tests {
         assert!(none.is_empty());
     }
 
-    #[cfg(feature = "symphonia")]
-    #[test]
-    fn test_frames_per_tick_bounds_the_timestamp_error() {
-        let tb = |numer, denom| TimeBase::try_new(numer, denom).unwrap();
-
-        // A millisecond tick spans 44.1 frames at 44.1 kHz, so a timestamp can be
-        // up to 45 frames away from the frame it refers to
-        assert_eq!(frames_per_tick(tb(1, 1000), 44_100), 45);
-        // The same tick is exact at 48 kHz
-        assert_eq!(frames_per_tick(tb(1, 1000), 48_000), 48);
-        // A time base of one tick per frame cannot be off at all
-        assert_eq!(frames_per_tick(tb(1, 44_100), 44_100), 1);
-    }
-
-    #[cfg(feature = "symphonia")]
-    #[test]
-    fn test_snap_to_grid_recovers_a_quantized_position() {
-        // One FLAC block after the anchor, as a millisecond timestamp at 44.1 kHz
-        // reports it: 22 frames early
-        assert_eq!(snap_to_grid(4586, 0, 4608, 45), 4608);
-        // Several blocks after a non-zero anchor, quantized late
-        assert_eq!(
-            snap_to_grid(10_000 + 3 * 4608 + 30, 10_000, 4608, 45),
-            23_824
-        );
-        // An exact position is already on the grid and stays put
-        assert_eq!(snap_to_grid(9216, 0, 4608, 1), 9216);
-
-        // At least one packet was lost, so the anchor itself is never the answer
-        assert_eq!(snap_to_grid(20, 0, 4608, 4608), 4608);
-
-        // An estimate too far off any grid point is left alone: something other
-        // than timestamp quantization moved it, and rounding would introduce an
-        // error of up to half a block instead of removing one of a few frames
-        assert_eq!(snap_to_grid(7000, 0, 4608, 45), 7000);
-        // The same estimate against a spacing it does fit
-        assert_eq!(snap_to_grid(7000, 0, 3500, 45), 7000);
-
-        // An estimate before the anchor is not on the grid ahead of it
-        assert_eq!(snap_to_grid(500, 1000, 4608, 45), 500);
-    }
-
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_expected_frames_is_bounded_by_the_file_length() {
         let bounded = Plan::resolve(
@@ -797,7 +634,6 @@ mod tests {
         assert_eq!(unbounded.expected_frames(Some(300)), Some(300));
     }
 
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_declared_plan_is_used_when_nothing_was_decoded() {
         let track = |channels| TrackInfo {
@@ -829,62 +665,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "symphonia")]
-    #[test]
-    fn test_gap_fill_is_bounded() {
-        // A hole inside the requested range is filled completely
-        assert_eq!(fill_frames(100, 900, 2, Some(2_000)), 100);
-        // ... but never beyond the frames the read was asked for
-        assert_eq!(fill_frames(100, 1_950, 2, Some(2_000)), 50);
-        assert_eq!(fill_frames(100, 2_000, 2, Some(2_000)), 0);
-        // Without a stop position, a bogus timestamp is capped by the same budget
-        // as the preallocation
-        assert_eq!(fill_frames(100, 0, 2, None), 100);
-        assert_eq!(fill_frames(u64::MAX, 0, 2, None), MAX_PREALLOC_SAMPLES / 2);
-        // The budget counts samples, so more channels leave room for fewer frames
-        assert_eq!(
-            fill_frames(u64::MAX, 0, 32, None),
-            MAX_PREALLOC_SAMPLES / 32
-        );
-        // A stop position wide enough to be no bound at all does not lift the
-        // budget either, so the fill can never be sized from a bogus timestamp
-        // alone
-        assert_eq!(
-            fill_frames(u64::MAX, 0, 2, Some(usize::MAX)),
-            MAX_PREALLOC_SAMPLES / 2
-        );
-    }
-
-    /// The frames the caller asked for, which bound a hole fill, are a property
-    /// of the config alone: a container claiming a different length cannot widen
-    /// or narrow them.
-    #[cfg(feature = "symphonia")]
-    #[test]
-    fn test_requested_frames_ignores_the_container() {
-        let plan = |config| Plan::resolve(48_000, 2, &config).unwrap();
-
-        assert_eq!(plan(ReadConfig::default()).requested_frames(), None);
-        assert_eq!(
-            plan(ReadConfig {
-                start: crate::reader::Position::Frame(100),
-                stop: crate::reader::Position::Frame(1_100),
-                ..Default::default()
-            })
-            .requested_frames(),
-            Some(1_000)
-        );
-
-        // Where the container is consulted, for the preallocation, it does bound
-        // the estimate
-        let bounded = plan(ReadConfig {
-            stop: crate::reader::Position::Frame(1_000),
-            ..Default::default()
-        });
-        assert_eq!(bounded.expected_frames(Some(400)), Some(400));
-        assert_eq!(bounded.requested_frames(), Some(1_000));
-    }
-
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_exact_frame_time_bases() {
         assert!(time_base_has_exact_frames(
@@ -905,7 +685,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "symphonia")]
     #[test]
     fn test_seek_landing_must_not_overshoot_start() {
         let tb = TimeBase::try_new(1, 1_000).unwrap();
@@ -1090,30 +869,25 @@ mod tests {
         );
     }
 
-    /// A packet the decoder rejects is discarded and the position is recovered
-    /// from the next timestamp. The frames of the discarded packet are lost, so
-    /// they have to be filled with silence: without the fill every later frame
-    /// moves earlier in the output and the read silently returns audio that no
-    /// longer lines up with the frame positions it was asked for.
+    /// A packet the decoder rejects fails the whole read. The alternative would
+    /// be to drop it and carry on, which returns a buffer that is either shorter
+    /// than the file or padded with silence the file never contained, neither of
+    /// which the caller can tell apart from real audio.
     #[cfg(all(
         any(feature = "all-codecs", feature = "mkv"),
         any(feature = "all-codecs", feature = "flac")
     ))]
     #[test]
-    fn test_discarded_packet_keeps_later_frames_aligned() {
-        // At 48 kHz a millisecond timestamp is an exact frame boundary, so the
-        // position after the hole comes straight from the timestamp. At 44.1 kHz it
-        // is not, and the exact position is only recoverable from the grid that the
-        // constant FLAC blocksize puts the packets on.
-        assert_discarded_packet_leaves_one_silent_hole("test_data/test_flac_48k.mka");
-        assert_discarded_packet_leaves_one_silent_hole("test_data/test_flac.mka");
+    fn test_damaged_packet_is_a_read_error() {
+        assert_damaged_packet_is_rejected("test_data/test_flac_48k.mka");
+        assert_damaged_packet_is_rejected("test_data/test_flac.mka");
     }
 
     #[cfg(all(
         any(feature = "all-codecs", feature = "mkv"),
         any(feature = "all-codecs", feature = "flac")
     ))]
-    fn assert_discarded_packet_leaves_one_silent_hole(source_path: &str) {
+    fn assert_damaged_packet_is_rejected(source_path: &str) {
         let intact = crate::reader::read::<f32>(source_path, ReadConfig::default())
             .unwrap()
             .samples_interleaved;
@@ -1122,70 +896,41 @@ mod tests {
         // A FLAC frame header is protected by a CRC-8, so flipping a bit in it
         // makes the decoder reject that one packet while all the others stay
         // decodable. The 14-bit sync word also occurs inside audio data, so try
-        // the candidates until one really loses a packet.
+        // the candidates until one really damages a packet header.
         let syncs = (0..source.len() - 1)
             .filter(|&i| source[i] == 0xFF && source[i + 1] & 0xFC == 0xF8)
             .collect::<Vec<_>>();
         assert!(!syncs.is_empty(), "fixture: no FLAC frame sync word found");
 
-        let path = crate::tmp_path("discarded-packet.mka");
+        let path = crate::tmp_path("damaged-packet.mka");
         for sync in syncs {
             let mut damaged_source = source.clone();
             damaged_source[sync + 3] ^= 0x0F;
             std::fs::write(&path, &damaged_source).unwrap();
 
-            let Ok(damaged) = crate::reader::read::<f32>(&path, ReadConfig::default()) else {
-                continue;
-            };
-            let damaged = damaged.samples_interleaved;
-            let hole = silent_hole(&damaged, &intact);
-
-            // A discarded packet either leaves a silent hole, or, without the
-            // fill, a shorter read. Anything else only corrupted the audio of a
-            // packet that still decoded, which is not the case under test.
-            if damaged.len() == intact.len() && hole.is_none() {
-                continue;
+            match crate::reader::read::<f32>(&path, ReadConfig::default()) {
+                // The flip landed inside a packet that still decodes, so the
+                // audio differs but no frames were lost. Not the case under test,
+                // and the length still has to be untouched: a read that comes up
+                // short without saying so is exactly what this guards against.
+                Ok(damaged) => assert_eq!(
+                    damaged.samples_interleaved.len(),
+                    intact.len(),
+                    "{source_path}: the read lost frames without reporting it"
+                ),
+                Err(error) => {
+                    assert!(
+                        matches!(error, ReadError::Decode(_)),
+                        "{source_path}: {error:?}"
+                    );
+                    assert!(!error.to_string().is_empty());
+                    std::fs::remove_file(&path).unwrap();
+                    return;
+                }
             }
-
-            assert_eq!(
-                damaged.len(),
-                intact.len(),
-                "the discarded packet shortened the read instead of leaving a hole"
-            );
-            let (gap_start, gap_end) = hole.expect("the hole must be silent");
-            assert!(
-                gap_end - gap_start < intact.len() / 4,
-                "{source_path}: more than one packet was discarded: {gap_start}..{gap_end}"
-            );
-            // Everything around the hole is still at its own position, frame for
-            // frame, which only holds if the recovered position was exact.
-            assert_eq!(damaged[..gap_start], intact[..gap_start], "{source_path}");
-            assert_eq!(damaged[gap_end..], intact[gap_end..], "{source_path}");
-
-            std::fs::remove_file(&path).unwrap();
-            return;
         }
 
-        panic!("{source_path}: no corrupted frame header made the decoder discard a packet");
-    }
-
-    /// The range `a` and `b` disagree over, if `a` is silent across all of it.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "mkv"),
-        any(feature = "all-codecs", feature = "flac")
-    ))]
-    fn silent_hole(a: &[f32], b: &[f32]) -> Option<(usize, usize)> {
-        let start = a.iter().zip(b).position(|(x, y)| x != y)?;
-        let trailing = a
-            .iter()
-            .rev()
-            .zip(b.iter().rev())
-            .position(|(x, y)| x != y)?;
-        let end = a.len() - trailing;
-        a[start..end]
-            .iter()
-            .all(|&s| s == 0.0)
-            .then_some((start, end))
+        panic!("{source_path}: no corrupted frame header made the decoder reject a packet");
     }
 
     /// Chained Ogg streams may replace the decoder and decoded layout. A real
