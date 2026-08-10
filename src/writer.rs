@@ -52,7 +52,12 @@ pub struct WriteConfig {
     pub sample_format: SampleFormat,
 }
 
-/// Write interleaved audio samples to a WAV file
+/// Write interleaved audio samples to a WAV file.
+///
+/// Samples are taken with full scale at `±1.0`. No gain is applied, but the
+/// integer formats have nowhere to put a sample beyond full scale, so anything
+/// outside `±1.0` is clamped. `Float32` stores what it is given, out of range
+/// included.
 pub fn write<F: Float>(
     path: impl AsRef<Path>,
     samples: &[F],

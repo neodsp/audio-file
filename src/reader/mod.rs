@@ -5,6 +5,22 @@
 //! only exists when the `symphonia` feature is on. `decode` is where the two
 //! meet - it tries the wav path first and only reaches for `general` when
 //! that declines the file.
+//!
+//! # Channel count limits
+//!
+//! Symphonia maps channels to named speaker positions rather than treating them
+//! as a plain count, so formats read through it have channel ceilings below what
+//! the format itself allows. Wav files read by the built-in decoder have no
+//! ceiling, and neither does Matroska, so prefer Matroska for high channel counts
+//! in a compressed format.
+//!
+//! - **WAV** files the built-in decoder cannot handle, so ADPCM and A-law/mu-law,
+//!   are rejected above 18 channels for an extensible `fmt ` chunk, or 26 for a
+//!   plain one.
+//! - **CAF** is unreliable above 18 channels: a 24-channel file decodes as 18
+//!   channels with misaligned samples and no error at all, and 32 channels is
+//!   rejected.
+//! - **FLAC** is capped at 8 channels by the format itself.
 
 use std::fs::File;
 use std::path::Path;
@@ -152,7 +168,11 @@ pub(crate) const MAX_PREALLOC_SAMPLES: usize = 16 * 1024 * 1024;
 /// Read an audio file from disk.
 ///
 /// Only the selected range is decoded and stored. `F` is the sample type of the
-/// returned audio, either `f32` or `f64`, normalized to `[-1.0, 1.0]`.
+/// returned audio, either `f32` or `f64`, with full scale at `±1.0`.
+///
+/// No gain is applied anywhere: integer samples are divided by the full scale of
+/// their bit depth, and float samples pass through as they are stored, so a file
+/// written with samples beyond `±1.0` still reads back beyond `±1.0`.
 ///
 /// The `stop` position of [`ReadConfig`] is exclusive, so reading from frame 100
 /// to frame 200 yields 100 frames. A `start` position beyond the end of the file
