@@ -32,6 +32,11 @@
   served by `rubato` directly. `ResampleError` stays public because
   `ReadError::Resample` carries it, but its path changed from
   `audio_file::resample::ResampleError` to `audio_file::ResampleError`.
+- `symphonia` is now an optional dependency, so `ReadError::Decode`, which
+  carries a `symphonia` error, exists only when it is enabled. Every codec
+  feature enables it and the default feature set enables all of them, so this
+  only affects builds with default features off. See below for what such a build
+  can still do.
 
 ## Improvements
 
@@ -107,6 +112,22 @@
 - Dependency housekeeping: `hound` is gone, the internal `audioadapter-buffers`
   dependency moved to 4, and `approx` moved to the dev-dependencies. None of them
   is part of the public API.
+- `symphonia` is optional. Wav files holding integer PCM or IEEE float samples,
+  which is everything this crate writes, are read by the built-in decoder, so a
+  build with default features off writes wav, reads wav, resamples, and pulls no
+  `symphonia` at all. That is 23 crates in the dependency tree instead of 46.
+  Every codec feature (`mp3`, `flac`, `mkv`, ...) enables it, so nothing changes
+  for anyone who names a format. `simd` is now a modifier rather than an enabler
+  and does nothing on its own in a build without `symphonia`.
+- The `wav` feature is replaced by `wav-compressed`, which adds the wav encodings the
+  built-in decoder does not cover: A-law, mu-law and ADPCM. Symphonia splits the
+  RIFF demuxer from the encodings inside it, so the old `wav` feature was the
+  demuxer alone and could decode none of them. Enabling it pulled all of
+  Symphonia in while widening what could be read by nothing at all: integer PCM
+  and IEEE float now read with no feature, and an A-law file still failed for
+  want of a codec. `wav-compressed` is the demuxer plus `pcm` and `adpcm`, which is
+  what reading those files actually takes. The supported format table now also
+  says which wav encodings need no feature.
 - `num` is replaced by `num-traits`, which is the only part of it this crate ever
   used. The `num` facade pulled in `num-bigint`, `num-rational` and `num-iter`
   for nothing. `num::Float` is a re-export of `num_traits::Float`, the same trait
@@ -117,6 +138,9 @@
 
 - `ReadError`: `NoChannels`, `TooManyChannels`, `InvalidChannelRange`,
   `ChannelCountChanged`, `SampleRateChanged`
+- `ReadError`: `UnsupportedFormat`, for a file no decoder in the build can read.
+  Only reachable without the `symphonia` feature, where the built-in wav decoder
+  is the whole reader and anything it declines has nowhere left to go.
 - `WriteError`: `ZeroChannels`, `ZeroSampleRate`, and `UnalignedSamples`.
   Writing with zero channels, a zero sample rate, or a sample count that is not
   a multiple of the channel count is now rejected before the file is created. A

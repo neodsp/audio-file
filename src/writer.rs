@@ -132,10 +132,6 @@ pub fn write_block<P: AsRef<Path>, F: Float + 'static>(
 #[cfg(test)]
 mod tests {
 
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_i8() {
         use super::*;
@@ -170,10 +166,6 @@ mod tests {
         std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_i16() {
         use super::*;
@@ -205,10 +197,6 @@ mod tests {
         std::fs::remove_file(&path).expect("Failed to remove temporary test file");
     }
 
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_i32() {
         use super::*;
@@ -322,10 +310,6 @@ mod tests {
 
     /// Multichannel output takes the extensible path, so check a decoder can
     /// still read it back.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_multichannel() {
         use super::*;
@@ -368,10 +352,6 @@ mod tests {
 
     /// A channel count wide enough to need the extensible layout, round
     /// tripped through the native WAV decoder.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_eighteen_channels() {
         use super::*;
@@ -410,10 +390,6 @@ mod tests {
     /// rejects a mask naming more than that. The native decoder in
     /// [`crate::wav`] reads `nChannels` directly and never looks at the mask,
     /// so a file with more channels than that ceiling now round trips too.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_many_channels_can_be_read_back() {
         use super::*;
@@ -488,11 +464,7 @@ mod tests {
 
     /// `write_block` reinterleaves before handing the samples to the encoder, so
     /// a channel-major block has to come back in the same order it went in.
-    #[cfg(all(
-        feature = "audio-blocks",
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
+    #[cfg(feature = "audio-blocks")]
     #[test]
     fn test_round_trip_block() {
         use super::*;
@@ -526,10 +498,6 @@ mod tests {
 
     /// The odd frame counts that need a pad byte have to survive a round trip,
     /// since a decoder that trusts the chunk size would otherwise read into it.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_odd_length() {
         use super::*;
@@ -563,10 +531,6 @@ mod tests {
 
     /// The public API is generic over the float type, so f64 input has to work
     /// end to end and not just in the encoder.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_f64_input() {
         use super::*;
@@ -599,10 +563,6 @@ mod tests {
 
     /// Full scale samples must not wrap around or drop out, which happens when
     /// the integer range is not exactly representable in the sample type.
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_full_scale_round_trip() {
         use super::*;
@@ -630,10 +590,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[cfg(all(
-        any(feature = "all-codecs", feature = "wav"),
-        any(feature = "all-codecs", feature = "pcm")
-    ))]
     #[test]
     fn test_round_trip_f32() {
         use super::*;
