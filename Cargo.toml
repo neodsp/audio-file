@@ -16,8 +16,8 @@ num-traits = "0.2"
 thiserror = "2"
 
 audio-blocks = { version = "0.7", optional = true }
-audioadapter-buffers = { version = "4", optional = true }
-rubato = { version = "4", optional = true }
+audioadapter-buffers = { version = "5", optional = true }
+rubato = { version = "5", optional = true }
 symphonia = { version = "0.6", default-features = false, optional = true }
 
 [dev-dependencies]
