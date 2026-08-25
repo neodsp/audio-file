@@ -802,7 +802,9 @@ mod tests {
         assert_eq!(
             selected.samples_interleaved,
             full.samples_interleaved
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|frame| frame[1])
                 .collect::<Vec<_>>()
         );
