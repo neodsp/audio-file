@@ -416,6 +416,16 @@ mod tests {
         InterleavedView::from_slice(&audio.samples_interleaved, audio.num_channels)
     }
 
+    /// A file that does not exist has to surface as an I/O error instead of a
+    /// panic, whatever decoders the build contains.
+    #[test]
+    fn test_missing_file_is_reported() {
+        match read::<f32>(crate::tmp_path("does-not-exist.wav"), ReadConfig::default()) {
+            Err(ReadError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("{:?}", other.map(|audio| audio.num_channels)),
+        }
+    }
+
     /// Without Symphonia the WAV decoder is the whole reader, so a file it does
     /// not recognize has nowhere left to go. That has to be said plainly rather
     /// than surfacing as a missing track or a decode failure.
