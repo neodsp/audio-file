@@ -12,7 +12,7 @@ Wav is now handled by this crate itself, in both directions.
   anything is written, write errors surface from `write` instead of on drop, and a
   failed write cleans up its truncated file.
 - **Symphonia and `rubato` are optional.** Both on by default. Turn them off and a
-  build that writes wav and reads wav has 8 crates in its tree instead of 46.
+  build that writes wav and reads wav has 8 crates in its tree instead of 44.
 - **A file is read in full or not at all.** A packet the decoder rejects is now an
   error instead of being silently skipped. Sample rate and channel layout come
   from the decoded audio, not from container metadata that may contradict it.
@@ -31,7 +31,7 @@ Wav is now handled by this crate itself, in both directions.
 
 ## Breaking Changes
 
-- `symphonia` 0.6 and `rubato` 4, both in the public API.
+- `symphonia` 0.6 and `rubato` 5, both in the public API.
 - `hound` is gone, so `WriteError::Encode` is gone. I/O errors are `WriteError::Io`.
 - The `resample` module is private. `ResampleError` moved to `audio_file::ResampleError`.
 - Error enums are `#[non_exhaustive]`, so a `match` needs a wildcard arm.
