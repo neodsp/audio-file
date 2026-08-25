@@ -12,9 +12,14 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # Full history, so that the check below can walk back from the tag to
+      # origin/main.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify tag matches crate version
+      - name: Verify the tag matches the crate version and sits on main
         run: |
           tag="$GITHUB_REF_NAME"
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -22,6 +27,22 @@ jobs:
             echo "Tag $tag does not match crate version $version"
             exit 1
           fi
+          # Only releases from main are published; a tag on a side branch must
+          # not ship.
+          commit=$(git rev-list -n 1 "$tag")
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "Tag $tag points at $commit, which is not on the main branch"
+            exit 1
+          fi
+
+      # Fails with a clear error if the version is already on crates.io, which a
+      # publish can never undo. A re-run after a partial failure then means
+      # finishing the release by hand: gh release create <tag> --notes-file release-notes.md
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
 
       - name: Create or update release
         env:
