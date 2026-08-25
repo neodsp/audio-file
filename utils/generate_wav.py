@@ -1,4 +1,5 @@
-#!/usr/bin/env uv run
+#!/usr/bin/env -S uv run
+# pyright: reportMissingImports=false
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
@@ -6,23 +7,30 @@
 # ]
 # ///
 
+from pathlib import Path
+
 import pyfar as pf
 
-# Parameters
-duration = 1  # seconds
-sample_rate = 48000  # Hz
-frequencies = [440, 554.37, 659.25, 880]  # A4, C#5, E5, A5
+DURATION_SECONDS = 1
+SAMPLE_RATE = 48_000
+FREQUENCIES = [440, 554.37, 659.25, 880]  # A4, C#5, E5, A5
 
-# Calculate number of samples
-n_samples = int(duration * sample_rate)
+repository_root = Path(__file__).resolve().parent.parent
+test_data = repository_root / "test_data"
+n_samples = DURATION_SECONDS * SAMPLE_RATE
 
-# Create 4-channel signal with different sine waves using pyfar
-signal = pf.signals.sine(frequencies, n_samples, sampling_rate=sample_rate)
+signal = pf.signals.sine(FREQUENCIES, n_samples, sampling_rate=SAMPLE_RATE)
+fixtures = {
+    test_data / "test_1ch.wav": signal[0],
+    test_data / "test_4ch.wav": signal,
+}
 
-# Write to WAV file
-pf.io.write_audio(signal, "sine_4ch_48khz.wav")
+for path, fixture in fixtures.items():
+    pf.io.write_audio(fixture, path, subtype="PCM_16")
+    print(
+        f"Generated {path.relative_to(repository_root)}: "
+        f"{fixture.cshape[0]} channel(s), {fixture.n_samples} frames, "
+        f"{fixture.sampling_rate} Hz"
+    )
 
-print("Generated 4-channel WAV file: sine_4ch_48khz.wav")
-print(f"Channels: {signal.cshape}")
-print(f"Duration: {signal.n_samples / signal.sampling_rate} seconds")
-print(f"Frequencies: {frequencies} Hz")
+print(f"Frequencies: {FREQUENCIES} Hz")

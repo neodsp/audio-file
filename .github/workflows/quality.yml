@@ -36,7 +36,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: RUSTFLAGS="-D warnings" cargo clippy
+      - run: cargo clippy --locked --all-features --all-targets --workspace -- -D warnings
+        # The optional features cfg out parts of the crate and its tests, so lint
+        # both ends of the range instead of only the complete one: nothing
+        # enabled at all, and each optional dependency that is not a codec on its
+        # own. `audio-blocks` without `resample` is its own combination, because
+        # the tests it adds build a `ReadConfig` that has one field fewer.
+      - run: cargo clippy --locked --no-default-features --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features resample --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features audio-blocks --all-targets --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features wav-compressed --all-targets --workspace -- -D warnings
 
   doc:
     name: 📚 Documentation
@@ -44,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --document-private-items
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --document-private-items
 
   semver:
     name: 🏷️ Semver Checks
@@ -62,7 +71,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
-      - run: cargo check --all-features
+        # --locked so that a dependency update cannot silently change what is
+        # checked, --all-targets so that the tests have to build as well.
+      - run: cargo check --locked --all-features --all-targets --workspace
 
   readme:
     name: 📖 README Check
@@ -71,4 +82,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-rdme
+        # cargo-rdme resolves intralinks with a pinned nightly rustdoc, which the
+        # stable toolchain alone does not provide. This is a rustup shim on the
+        # runner, so the toolchain has to be installed explicitly.
+      - run: cargo rdme install-rust-toolchain-for-intralinks
       - run: cargo rdme --check

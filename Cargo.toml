@@ -9,43 +9,70 @@ name = "audio-file"
 readme = "README.md"
 repository = "https://github.com/neodsp/audio-file"
 rust-version = "1.88"
-version = "0.4.1"
+version = "0.5.0"
 
 [dependencies]
-approx = "0.5"
-audioadapter-buffers = "2"
-hound = "3.5"
-num = "0.4"
-rubato = "1"
-symphonia = "0.5"
+num-traits = "0.2"
 thiserror = "2"
 
 audio-blocks = { version = "0.7", optional = true }
+audioadapter-buffers = { version = "5", optional = true }
+rubato = { version = "5", optional = true }
+symphonia = { version = "0.6", default-features = false, optional = true }
 
 [dev-dependencies]
+approx = "0.5"
 audio-blocks = { version = "0.7" }
 
 [features]
-default = ["all-codecs"]
+default = ["all-codecs", "resample", "simd"]
 
 # Add utility functions for channel access etc
 audio-blocks = ["dep:audio-blocks"]
 
-# All codecs including royalty-encumbered formats (MP3, AAC, etc.)
-all-codecs = ["symphonia/all"]
+# Resample while reading, via rubato. Enabled by default; turn it off along
+# with the other default features for the most minimal build, wav in and out
+# with no resampling and neither rubato nor Symphonia in the dependency tree.
+resample = ["dep:audioadapter-buffers", "dep:rubato"]
 
-aac = ["symphonia/aac"]
-adpcm = ["symphonia/adpcm"]
-aiff = ["symphonia/aiff"]
-alac = ["symphonia/alac"]
-caf = ["symphonia/caf"]
-flac = ["symphonia/flac"]
-isomp4 = ["symphonia/isomp4"]
-mkv = ["symphonia/mkv"]
-mp1 = ["symphonia/mp1"]
-mp2 = ["symphonia/mp2"]
-mp3 = ["symphonia/mp3"]
-ogg = ["symphonia/ogg"]
-pcm = ["symphonia/pcm"]
-vorbis = ["symphonia/vorbis"]
-wav = ["symphonia/wav"]
+# Symphonia's SIMD optimizations. A modifier rather than an enabler, so it does
+# nothing in a build without Symphonia. Not free either way: it brings `rustfft`
+# and the four crates behind it into the tree, which is why it is a knob at all
+# and not simply always on wherever Symphonia is.
+simd = ["symphonia?/opt-simd"]
+
+# Read anything the built-in wav decoder does not cover, through Symphonia.
+# Every codec feature below enables it, so it is rarely named on its own. Without
+# it this crate writes wav and reads integer PCM and IEEE float wav, which is
+# everything it writes itself, and nothing else.
+symphonia = ["dep:symphonia"]
+
+# All codecs including royalty-encumbered formats (MP3, AAC, etc.)
+all-codecs = ["symphonia", "symphonia/all"]
+
+# The wav encodings the built-in decoder does not cover: A-law, mu-law and
+# ADPCM.
+#
+# There is deliberately no plain `wav` feature. Symphonia splits the RIFF
+# demuxer from the encodings inside it, and the demuxer on its own can decode
+# none of them, so a `wav` feature would pull all of Symphonia in while widening
+# what can be read by nothing at all: integer PCM and IEEE float already read
+# with no feature, and an A-law file would still fail for want of a codec.
+wav-compressed = ["adpcm", "pcm", "symphonia", "symphonia/wav"]
+
+# Individual containers and codecs. A container and the codec inside it are
+# separate features, so a format that can hold several codecs needs one of each.
+aac = ["symphonia", "symphonia/aac"]
+adpcm = ["symphonia", "symphonia/adpcm"]
+aiff = ["symphonia", "symphonia/aiff"]
+alac = ["symphonia", "symphonia/alac"]
+caf = ["symphonia", "symphonia/caf"]
+flac = ["symphonia", "symphonia/flac"]
+isomp4 = ["symphonia", "symphonia/isomp4"]
+mkv = ["symphonia", "symphonia/mkv"]
+mp1 = ["symphonia", "symphonia/mp1"]
+mp2 = ["symphonia", "symphonia/mp2"]
+mp3 = ["symphonia", "symphonia/mp3"]
+ogg = ["symphonia", "symphonia/ogg"]
+pcm = ["symphonia", "symphonia/pcm"]
+vorbis = ["symphonia", "symphonia/vorbis"]
