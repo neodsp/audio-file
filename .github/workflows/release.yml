@@ -5,8 +5,13 @@ on:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
 
+# Publishes with crates.io trusted publishing, so no API token is stored in the
+# repository.
 permissions:
+  # creates the GitHub release
   contents: write
+  # requests the OIDC token that crates.io exchanges for a short-lived publish token
+  id-token: write
 
 jobs:
   release:
@@ -39,9 +44,11 @@ jobs:
       # Fails with a clear error if the version is already on crates.io, which a
       # publish can never undo. A re-run after a partial failure then means
       # finishing the release by hand: gh release create <tag> --notes-file release-notes.md
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
 
       - name: Create or update release
