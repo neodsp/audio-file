@@ -11,14 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Tested against the latest dependency releases: `audioadapter-buffers` 5.2.0,
-  `rubato` 5.0.1, `symphonia` 0.6.1 and `thiserror` 2.0.21. The minimum versions
-  this crate requires are unchanged.
-- Releases are published to crates.io with trusted publishing, so no API token is
-  stored in the repository.
-- The GitHub release notes are taken from this changelog.
-- CI also checks for unused dependencies and that the crate packages cleanly, and
-  treats compiler warnings as errors on macOS and Windows.
+- Updated dependencies: `audioadapter-buffers` 5.2.0, `rubato` 5.0.1,
+  `symphonia` 0.6.1 and `thiserror` 2.0.21. The minimum versions this crate
+  requires are unchanged.
 
 ## [0.5.0] - 2026-08-25
 
