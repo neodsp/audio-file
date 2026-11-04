@@ -41,9 +41,26 @@ jobs:
             exit 1
           fi
 
+      # The release notes are the tag's section of CHANGELOG.md, without its
+      # heading. Checked before publishing, because a publish can never be undone
+      # and a release without notes is a changelog entry that was forgotten.
+      - name: Extract the release notes from the changelog
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '
+            index($0, "## [" tag "]") == 1 { found = 1; next }
+            found && /^## \[|^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no entry for $GITHUB_REF_NAME"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/release-notes.md"
+
       # Fails with a clear error if the version is already on crates.io, which a
       # publish can never undo. A re-run after a partial failure then means
-      # finishing the release by hand: gh release create <tag> --notes-file release-notes.md
+      # finishing the release by hand, with the notes from the changelog:
+      # gh release create <tag> --notes-file <notes>
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish to crates.io
@@ -58,7 +75,7 @@ jobs:
         # workflow for a tag would fail instead of updating the notes.
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
           else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --verify-tag
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" --verify-tag
           fi

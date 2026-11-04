@@ -28,7 +28,7 @@ checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 
 [[package]]
 name = "audio-file"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "approx",
  "audio-blocks",
