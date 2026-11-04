@@ -179,11 +179,9 @@ only the formats you need instead:
 
 A container and the codec inside it are separate flags, so a format that can hold several
 codecs needs one of each. Enabling only the container reads no file at all. A file no decoder
-in the build can read fails with [`ReadError::Decode`](https://docs.rs/audio-file/latest/audio_file/reader/enum.ReadError.html#variant.Decode),
-wrapping Symphonia's `Unsupported` error. A build without any codec feature has only the
-built-in wav decoder, and there such a file fails with
-[`ReadError::UnsupportedFormat`](https://docs.rs/audio-file/latest/audio_file/reader/enum.ReadError.html#variant.UnsupportedFormat)
-instead.
+in the build can read fails with `ReadError::Decode`, wrapping Symphonia's `Unsupported`
+error. A build without any codec feature has only the built-in wav decoder, and there such a
+file fails with [`ReadError::UnsupportedFormat`](https://docs.rs/audio-file/latest/audio_file/reader/enum.ReadError.html#variant.UnsupportedFormat) instead.
 
 Some formats have channel ceilings below what the format itself allows, see the
 [`reader`](https://docs.rs/audio-file/latest/audio_file/reader/) module docs.
