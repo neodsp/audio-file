@@ -41,5 +41,4 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=address"
       - run: cargo test --all-features --target x86_64-unknown-linux-gnu
         env:
-          LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
