@@ -1,4 +1,4 @@
-name: 🧪 Tests
+name: Tests
 
 on:
   push:
@@ -6,19 +6,29 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: 🧪 Full Test Suite on ${{ matrix.os }}
+    name: Full Test Suite on ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # clippy only runs on Linux, so compiler warnings are errors here to still
+      # catch platform-specific ones
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-features --all-targets --workspace
         # --all-targets skips doc tests, so run them separately. Both with the
         # default features and with all of them, so that a doc example using an
@@ -27,11 +37,12 @@ jobs:
       - run: cargo test --locked --all-features --doc --workspace
 
   minimal:
-    name: 🪶 Minimal Build (no features)
+    name: Minimal Build (no features)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --no-default-features --all-targets --workspace
         # The doc examples that need an optional feature are cfg'd out rather
         # than skipped, so they have to keep compiling here too.
@@ -49,9 +60,10 @@ jobs:
           fi
 
   reduced-features:
-    name: 🧪 Reduced Features (${{ matrix.features }})
+    name: Reduced Features (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         # One entry per optional dependency that is not a codec, so that each is
         # exercised on its own, plus a container/codec pair per Symphonia format.
@@ -68,8 +80,11 @@ jobs:
             "mp3",
           ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
         # Every test that needs a fixture format is gated on the features of that
         # format, so the whole suite runs for each combination. A name filter
         # would pass silently once the test it names is renamed, because cargo
